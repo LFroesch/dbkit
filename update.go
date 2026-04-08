@@ -73,6 +73,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			if m.activeDB != nil {
+				m.activeDB.Close()
+			}
+			return m, tea.Quit
+		}
 		// Help overlay — any key closes
 		if m.showHelp {
 			m.showHelp = false
@@ -86,7 +92,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Global keys
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "q":
 			if m.activeTab == tabQuery && m.queryFocus {
 				break // let textarea handle
 			}
