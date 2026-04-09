@@ -27,11 +27,6 @@ Command:
 ```bash
 dbkit
 ```
-## Usage
-
-```bash
-dbkit
-```
 
 ## Tabs
 
@@ -67,3 +62,7 @@ dbkit
 - **MongoDB** — stub, coming soon
 
 Config saved to `~/.dbkit/config.json`.
+
+## License
+
+[AGPL-3.0](LICENSE)
