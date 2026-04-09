@@ -1,6 +1,12 @@
-build:
-	go build -o dbkit
-cp:
-	cp dbkt ~/.local/bin/
+BIN := dbkit
+BUILD_TARGET := .
+INSTALL_DIR ?= $(HOME)/.local/bin
 
-install: build cp
+build:
+	go build -o $(BIN) $(BUILD_TARGET)
+
+install: build
+	mkdir -p $(INSTALL_DIR)
+	install -m 0755 $(BIN) $(INSTALL_DIR)/$(BIN)
+
+.PHONY: build install
