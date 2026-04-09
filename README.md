@@ -6,6 +6,8 @@ Database TUI — scout-style panels + tabs for SQLite, Postgres, and MongoDB.
 
 Supported platforms: Linux and macOS. On Windows, use WSL.
 
+Note: building from source requires gcc for sqlite3 (cgo). On Ubuntu: `sudo apt install gcc`.
+
 Recommended (installs to `~/.local/bin`):
 
 ```bash
@@ -25,15 +27,6 @@ Command:
 ```bash
 dbkit
 ```
-## Install
-
-```bash
-make build        # → bin/dbkit
-make install      # → $GOPATH/bin/dbkit
-```
-
-Requires gcc for sqlite3 (cgo). On Ubuntu: `sudo apt install gcc`.
-
 ## Usage
 
 ```bash
