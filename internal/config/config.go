@@ -16,10 +16,16 @@ type Connection struct {
 	DSN  string `json:"dsn"`
 }
 
+type SavedQuery struct {
+	Label string `json:"label"`
+	Query string `json:"query"`
+}
+
 // Config holds all persisted state.
 type Config struct {
-	Connections  []Connection        `json:"connections"`
-	QueryHistory map[string][]string `json:"query_history,omitempty"`
+	Connections  []Connection            `json:"connections"`
+	QueryHistory map[string][]string     `json:"query_history,omitempty"`
+	SavedQueries map[string][]SavedQuery `json:"saved_queries,omitempty"`
 }
 
 func configPath() string {
@@ -91,6 +97,9 @@ func (c *Config) DeleteConnection(idx int) {
 	if c.QueryHistory != nil {
 		delete(c.QueryHistory, c.Connections[idx].ID)
 	}
+	if c.SavedQueries != nil {
+		delete(c.SavedQueries, c.Connections[idx].ID)
+	}
 	c.Connections = append(c.Connections[:idx], c.Connections[idx+1:]...)
 }
 
@@ -130,4 +139,42 @@ func (c *Config) PushQuery(connID, query string, limit int) {
 		history = history[:limit]
 	}
 	c.QueryHistory[connID] = history
+}
+
+func (c *Config) SavedQueriesForConnection(connID string) []SavedQuery {
+	if c.SavedQueries == nil {
+		return nil
+	}
+	saved := c.SavedQueries[connID]
+	if len(saved) == 0 {
+		return nil
+	}
+	out := make([]SavedQuery, len(saved))
+	copy(out, saved)
+	return out
+}
+
+func (c *Config) SaveQuery(connID, label, query string, limit int) {
+	if connID == "" || query == "" {
+		return
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if c.SavedQueries == nil {
+		c.SavedQueries = map[string][]SavedQuery{}
+	}
+	saved := c.SavedQueries[connID]
+	filtered := make([]SavedQuery, 0, len(saved))
+	for _, existing := range saved {
+		if existing.Query == query {
+			continue
+		}
+		filtered = append(filtered, existing)
+	}
+	saved = append([]SavedQuery{{Label: label, Query: query}}, filtered...)
+	if len(saved) > limit {
+		saved = saved[:limit]
+	}
+	c.SavedQueries[connID] = saved
 }

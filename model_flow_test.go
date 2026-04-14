@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -65,6 +66,27 @@ func TestEditorEscReturnsFocusToResultsPane(t *testing.T) {
 	}
 	if got.focus != panelRight {
 		t.Fatalf("expected focus to stay on right pane, got %v", got.focus)
+	}
+}
+
+func TestSchemaRightPaneCIgnored(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabSchema
+	m.focus = panelRight
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "id", Type: "integer", PrimaryKey: true, Nullable: false},
+		},
+	}
+	m.syncSchemaTable()
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	got := next.(Model)
+
+	if got.statusMsg != "" {
+		t.Fatalf("expected no status change, got %q", got.statusMsg)
 	}
 }
 
@@ -358,6 +380,141 @@ func TestTabOpensColumnPickerFromQueryEditor(t *testing.T) {
 	}
 }
 
+func TestTypingInQueryEditorDoesNotAutoOpenCompletionPicker(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users"}
+	m.tableCursor = 0
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "id", Type: "integer", PrimaryKey: true},
+			{Name: "email", Type: "text"},
+		},
+	}
+	m.queryInput.SetValue("SELECT")
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	got := next.(Model)
+
+	if got.showColumnPicker {
+		t.Fatalf("expected completion picker to stay closed until requested")
+	}
+}
+
+func TestCtrlLClearsQueryEditor(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.queryInput.SetValue("SELECT * FROM users;")
+	m.snippetPlaceholders = []snippetPlaceholder{{name: "table", start: 14, end: 19, fresh: true}}
+	m.queryHistoryIdx = 1
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlL})
+	got := next.(Model)
+
+	if got.queryInput.Value() != "" {
+		t.Fatalf("query input = %q, want empty", got.queryInput.Value())
+	}
+	if len(got.snippetPlaceholders) != 0 {
+		t.Fatalf("expected snippet placeholders to clear")
+	}
+	if got.queryHistoryIdx != -1 {
+		t.Fatalf("queryHistoryIdx = %d, want -1", got.queryHistoryIdx)
+	}
+}
+
+func TestDeleteConnectionRequiresConfirmation(t *testing.T) {
+	m := newModel(&config.Config{
+		Connections: []config.Connection{
+			{ID: "a", Name: "main", Type: "sqlite", DSN: "main.db"},
+		},
+	})
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	got := next.(Model)
+
+	if !got.showConfirm {
+		t.Fatalf("expected delete confirmation modal")
+	}
+	if got.confirmAction != confirmDeleteConnection {
+		t.Fatalf("confirmAction = %v, want delete connection", got.confirmAction)
+	}
+	if len(got.cfg.Connections) != 1 {
+		t.Fatalf("connection deleted before confirmation")
+	}
+}
+
+func TestDeleteConnectionConfirmationExecutesDeletion(t *testing.T) {
+	m := newModel(&config.Config{
+		Connections: []config.Connection{
+			{ID: "a", Name: "main", Type: "sqlite", DSN: "main.db"},
+		},
+	})
+	m.openDeleteConnectionConfirm(0)
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got := next.(Model)
+
+	if got.showConfirm {
+		t.Fatalf("expected confirmation modal to close")
+	}
+	if len(got.cfg.Connections) != 0 {
+		t.Fatalf("expected connection to be deleted after confirmation")
+	}
+}
+
+func TestWriteQueryRequiresConfirmationBeforeRun(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.queryInput.SetValue(`DELETE FROM "users";`)
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	got := next.(Model)
+
+	if cmd != nil {
+		t.Fatalf("expected query command to wait for confirmation")
+	}
+	if !got.showConfirm {
+		t.Fatalf("expected write query confirmation modal")
+	}
+	if got.confirmAction != confirmRunQuery {
+		t.Fatalf("confirmAction = %v, want run query", got.confirmAction)
+	}
+}
+
+func TestWriteQueryRunsAfterConfirmation(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.queryInput.SetValue(`DELETE FROM "users";`)
+	m.openRunQueryConfirm(`DELETE FROM "users";`)
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got := next.(Model)
+
+	if got.showConfirm {
+		t.Fatalf("expected confirmation modal to close")
+	}
+	if !got.loading {
+		t.Fatalf("expected loading state after confirming write query")
+	}
+	if cmd == nil {
+		t.Fatalf("expected query command after confirmation")
+	}
+}
+
 func TestPushQueryHistoryMovesDuplicateToFront(t *testing.T) {
 	m := newModel(&config.Config{})
 	m.pushQueryHistory("select 1;")
@@ -395,11 +552,11 @@ func TestColumnPickerInsertsColumnsAtCursor(t *testing.T) {
 	m.queryInput.SetValue(`SELECT  FROM "users";`)
 	setTextareaCursor(&m.queryInput, 0, len("SELECT "))
 
-	if !m.openColumnPickerForCursor("Columns", true) {
+	if !m.openCompletionForCursor(true) {
 		t.Fatalf("expected column picker to open")
 	}
 	for i := range m.columnPickerItems {
-		if m.columnPickerItems[i].name == "email" || m.columnPickerItems[i].name == "created_at" {
+		if m.columnPickerItems[i].label == "email" || m.columnPickerItems[i].label == "created_at" {
 			m.columnPickerItems[i].selected = true
 		}
 	}
@@ -410,6 +567,176 @@ func TestColumnPickerInsertsColumnsAtCursor(t *testing.T) {
 	want := `SELECT "email", "created_at" FROM "users";`
 	if got.queryInput.Value() != want {
 		t.Fatalf("query input = %q, want %q", got.queryInput.Value(), want)
+	}
+}
+
+func TestTabOpensTablePickerFromFromClause(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users", "orders"}
+	m.queryInput.SetValue(`SELECT * FROM `)
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+
+	if !got.showColumnPicker {
+		t.Fatalf("expected completion picker to open")
+	}
+	if got.columnPickerTitle != "From Table" {
+		t.Fatalf("picker title = %q, want From Table", got.columnPickerTitle)
+	}
+	if len(got.columnPickerItems) != 2 {
+		t.Fatalf("picker items = %d, want 2", len(got.columnPickerItems))
+	}
+}
+
+func TestMongoCompletionStartsWithCommandSuggestions(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users", "events"}
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+
+	if !got.showColumnPicker {
+		t.Fatalf("expected completion picker to open")
+	}
+	if got.columnPickerTitle != "Mongo Commands" {
+		t.Fatalf("picker title = %q, want Mongo Commands", got.columnPickerTitle)
+	}
+	if len(got.columnPickerItems) == 0 || got.columnPickerItems[0].label != "find" {
+		t.Fatalf("expected find command suggestion, got %#v", got.columnPickerItems)
+	}
+}
+
+func TestSnippetCompletionCreatesPlaceholderSession(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users"}
+	m.tableCursor = 0
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "id", Type: "integer", PrimaryKey: true},
+			{Name: "email", Type: "text"},
+		},
+	}
+
+	if !m.openCompletionForCursor(true) {
+		t.Fatalf("expected completion picker to open")
+	}
+	m.columnPickerCursor = 0
+
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyEnter})
+	got := next.(Model)
+
+	if len(got.snippetPlaceholders) == 0 {
+		t.Fatalf("expected snippet placeholders to be active")
+	}
+	if !strings.Contains(got.queryInput.Value(), "${columns}") {
+		t.Fatalf("expected snippet text in query input, got %q", got.queryInput.Value())
+	}
+}
+
+func TestTabJumpsSnippetPlaceholders(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.queryInput.SetValue("SELECT ${columns} FROM ${table};")
+	m.snippetPlaceholders = []snippetPlaceholder{
+		{name: "columns", start: len("SELECT "), end: len("SELECT ${columns}"), fresh: true},
+		{name: "table", start: len("SELECT ${columns} FROM "), end: len("SELECT ${columns} FROM ${table}"), fresh: true},
+	}
+	m.snippetIndex = 0
+	m.focusSnippetPlaceholder(0)
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+
+	if got.snippetIndex != 1 {
+		t.Fatalf("snippet index = %d, want 1", got.snippetIndex)
+	}
+}
+
+func TestCurrentResultRowJSONReturnsValidJSON(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.queryResult = &db.QueryResult{
+		Columns: []string{"id", "payload"},
+		Rows: [][]string{
+			{"1", `{"meta":{"status":"ok"}}`},
+		},
+	}
+
+	got := m.currentResultRowJSON()
+
+	if !strings.Contains(got, `"id": "1"`) {
+		t.Fatalf("expected scalar string field, got %q", got)
+	}
+	if !strings.Contains(got, `"payload": {`) {
+		t.Fatalf("expected nested json object, got %q", got)
+	}
+}
+
+func TestAllResultRowsCSVIncludesHeaders(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.queryResult = &db.QueryResult{
+		Columns: []string{"id", "email"},
+		Rows: [][]string{
+			{"1", "a@example.com"},
+			{"2", "b@example.com"},
+		},
+	}
+
+	got := m.allResultRowsCSV()
+	if !strings.HasPrefix(got, "id,email\n") {
+		t.Fatalf("csv header missing, got %q", got)
+	}
+	if !strings.Contains(got, "1,a@example.com") {
+		t.Fatalf("csv row missing, got %q", got)
+	}
+}
+
+func TestSaveCurrentQueryPersistsToConfig(t *testing.T) {
+	home := t.TempDir()
+	prevHome := os.Getenv("HOME")
+	t.Setenv("HOME", home)
+	defer func() {
+		_ = os.Setenv("HOME", prevHome)
+	}()
+
+	cfg := &config.Config{
+		Connections: []config.Connection{{ID: "abc123", Name: "main", Type: "sqlite", DSN: "test.db"}},
+	}
+	m := newModel(cfg)
+	m.activeConnIdx = 0
+	m.queryInput.SetValue("SELECT *\nFROM users;")
+
+	next, _ := m.saveCurrentQuery()
+	got := next.(Model)
+
+	if len(got.savedQueries) != 1 {
+		t.Fatalf("saved queries = %d, want 1", len(got.savedQueries))
+	}
+	if got.savedQueries[0].Label != "SELECT *" {
+		t.Fatalf("saved query label = %q", got.savedQueries[0].Label)
+	}
+	if len(cfg.SavedQueries["abc123"]) != 1 {
+		t.Fatalf("config saved queries = %d, want 1", len(cfg.SavedQueries["abc123"]))
 	}
 }
 
@@ -485,11 +812,8 @@ func TestCurrentResultRowJSONUsesStructuredInspectView(t *testing.T) {
 	if !strings.Contains(got, `"payload":`) {
 		t.Fatalf("expected payload field in copied result row, got %q", got)
 	}
-	if !strings.Contains(got, `"meta": {`) {
+	if !strings.Contains(got, `"meta": {`) || !strings.Contains(got, `"tags": [`) {
 		t.Fatalf("expected nested json to be expanded, got %q", got)
-	}
-	if !strings.Contains(got, `"tags": [`) {
-		t.Fatalf("expected arrays to be expanded, got %q", got)
 	}
 }
 

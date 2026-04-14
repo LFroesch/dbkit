@@ -24,7 +24,7 @@ const (
 	tabCount
 )
 
-var tabNames = [tabCount]string{"Connections", "Browse", "Query", "Results", "History", "Helpers"}
+var tabNames = [tabCount]string{"Connections", "Schema", "Query", "Results", "History", "Helpers"}
 var primaryTabs = []tab{tabConnections, tabSchema, tabQuery, tabResults}
 
 type queryHelper struct {
@@ -41,10 +41,26 @@ type queryPickerItem struct {
 }
 
 type columnPickerItem struct {
-	name     string
-	dataType string
-	selected bool
+	label      string
+	detail     string
+	insertText string
+	selected   bool
 }
+
+type snippetPlaceholder struct {
+	name  string
+	start int
+	end   int
+	fresh bool
+}
+
+type confirmAction int
+
+const (
+	confirmNone confirmAction = iota
+	confirmDeleteConnection
+	confirmRunQuery
+)
 
 type panel int
 
@@ -132,6 +148,7 @@ type Model struct {
 	resultColOffset     int
 	resultVisibleColumn int
 	queryHistory        []string
+	savedQueries        []config.SavedQuery
 	queryHistoryIdx     int
 	lastRunQuery        string
 
@@ -171,12 +188,22 @@ type Model struct {
 	columnPickerStart    int
 	columnPickerEnd      int
 	columnPickerFallback string
+	snippetPlaceholders  []snippetPlaceholder
+	snippetIndex         int
 	// Modal overlay: inspect selected row/value details
 	showInspect   bool
 	inspectTitle  string
 	inspectLines  []string
 	inspectCopy   string
 	inspectScroll int
+	// Modal overlay: destructive action confirmation
+	showConfirm    bool
+	confirmTitle   string
+	confirmBody    []string
+	confirmAccept  string
+	confirmAction  confirmAction
+	confirmConnIdx int
+	confirmQuery   string
 
 	// Last copied text for fallback/status purposes
 	lastCopied string
@@ -195,7 +222,7 @@ func newModel(cfg *config.Config) Model {
 
 	// Query textarea
 	ta := textarea.New()
-	ta.Placeholder = "Enter SQL query... (ctrl+r to run)"
+	ta.Placeholder = "Write SQL... ctrl+r runs, tab opens completions"
 	ta.ShowLineNumbers = false
 	ta.SetWidth(60)
 	ta.SetHeight(6)
