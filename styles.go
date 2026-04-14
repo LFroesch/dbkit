@@ -1,91 +1,108 @@
 package main
 
-import "github.com/charmbracelet/lipgloss"
-
-const (
-	colorBg     = lipgloss.Color("235")
-	colorPurple = lipgloss.Color("99")
-	colorOrange = lipgloss.Color("214")
-	colorWhite  = lipgloss.Color("255")
-	colorGray   = lipgloss.Color("242")
-	colorDark   = lipgloss.Color("238")
-	colorGreen  = lipgloss.Color("120")
-	colorRed    = lipgloss.Color("196")
-	colorCyan   = lipgloss.Color("87")
-	colorYellow = lipgloss.Color("226")
+import (
+	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/lipgloss"
 )
 
 var (
-	purpleStyle = lipgloss.NewStyle().Background(colorBg).Foreground(colorPurple)
-	orangeStyle = lipgloss.NewStyle().Background(colorBg).Foreground(colorOrange)
-	grayStyle   = lipgloss.NewStyle().Background(colorBg).Foreground(colorGray)
-	whiteStyle  = lipgloss.NewStyle().Background(colorBg).Foreground(colorWhite)
-	greenStyle  = lipgloss.NewStyle().Foreground(colorGreen)
-	redStyle    = lipgloss.NewStyle().Foreground(colorRed)
-	cyanStyle   = lipgloss.NewStyle().Foreground(colorCyan)
-	yellowStyle = lipgloss.NewStyle().Foreground(colorYellow)
+	// Shared tui-suite palette (sb/runx family)
+	colorPrimary = lipgloss.Color("#5AF78E")
+	colorAccent  = lipgloss.Color("#57C7FF")
+	colorWarn    = lipgloss.Color("#FF6AC1")
+	colorError   = lipgloss.Color("#FF5C57")
+	colorDim     = lipgloss.Color("#606060")
+	colorText    = lipgloss.Color("#EEEEEE")
+	colorBg      = lipgloss.Color("#1A1A2E")
+	colorSurface = lipgloss.Color("#2A2A40")
+	colorYellow  = lipgloss.Color("#F3F99D")
 
-	headerStyle = lipgloss.NewStyle().
-			Background(colorBg).
-			Foreground(colorPurple).
+	titleStyle = lipgloss.NewStyle().
 			Bold(true).
-			Padding(0, 1)
+			Foreground(colorPrimary)
+
+	activeTabStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(colorAccent)
+
+	inactiveTabStyle = lipgloss.NewStyle().
+				Foreground(colorDim)
+
+	keyStyle = lipgloss.NewStyle().
+			Foreground(colorAccent).
+			Bold(true)
+
+	actionStyle = lipgloss.NewStyle().
+			Foreground(colorPrimary)
+
+	dimStyle = lipgloss.NewStyle().
+			Foreground(colorDim)
+
+	textStyle = lipgloss.NewStyle().
+			Foreground(colorText)
+
+	primaryStyle = lipgloss.NewStyle().
+			Foreground(colorPrimary)
+
+	accentStyle = lipgloss.NewStyle().
+			Foreground(colorAccent)
+
+	warnStyle = lipgloss.NewStyle().
+			Foreground(colorWarn)
+
+	errorStyle = lipgloss.NewStyle().
+			Foreground(colorError).
+			Bold(true)
 
 	statusStyle = lipgloss.NewStyle().
-			Background(colorBg).
-			Foreground(colorWhite).
-			Width(0) // set dynamically
-
-	tabActiveStyle = lipgloss.NewStyle().
-			Background(colorPurple).
-			Foreground(colorBg).
-			Bold(true).
-			Padding(0, 2)
-
-	tabInactiveStyle = lipgloss.NewStyle().
-				Background(colorDark).
-				Foreground(colorGray).
-				Padding(0, 2)
-
-	tabBarStyle = lipgloss.NewStyle().
-			Background(colorBg).
-			Padding(0, 0)
+			Foreground(colorDim)
 
 	panelStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorGray)
+			BorderForeground(colorDim).
+			Padding(0, 1)
 
-	activePanelStyle = lipgloss.NewStyle().
+	panelActiveStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
-				BorderForeground(colorPurple)
+				BorderForeground(colorAccent).
+				Padding(0, 1)
+
+	panelHeaderStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(colorAccent)
 
 	selectedItemStyle = lipgloss.NewStyle().
-				Background(colorPurple).
-				Foreground(colorBg).
+				Foreground(colorPrimary).
+				Background(colorSurface).
 				Bold(true)
-
-	dimItemStyle = lipgloss.NewStyle().
-			Foreground(colorGray)
-
-	labelStyle = lipgloss.NewStyle().
-			Foreground(colorPurple).
-			Bold(true)
-
-	connectedStyle = lipgloss.NewStyle().
-			Foreground(colorGreen).
-			Bold(true)
-
-	errorStyle = lipgloss.NewStyle().
-			Foreground(colorRed)
 
 	tableHeaderStyle = lipgloss.NewStyle().
-				Background(colorDark).
-				Foreground(colorCyan).
-				Bold(true)
+				Bold(true).
+				Foreground(colorAccent)
 
-	pkStyle = lipgloss.NewStyle().
-		Foreground(colorOrange)
+	connectedStyle = lipgloss.NewStyle().
+			Foreground(colorPrimary).
+			Bold(true)
 
-	nullableStyle = lipgloss.NewStyle().
-			Foreground(colorGray)
+	dialogStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorAccent).
+			Padding(1, 2)
 )
+
+func newTableStyles() table.Styles {
+	s := table.DefaultStyles()
+	s.Header = s.Header.
+		Foreground(colorAccent).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderBottom(true).
+		BorderForeground(colorDim).
+		Bold(true)
+	s.Cell = s.Cell.
+		Foreground(colorText)
+	s.Selected = s.Selected.
+		Foreground(colorPrimary).
+		Background(colorSurface).
+		Bold(true)
+	return s
+}

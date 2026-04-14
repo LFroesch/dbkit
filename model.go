@@ -3,6 +3,7 @@ package main
 import (
 	"time"
 
+	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -17,11 +18,33 @@ const (
 	tabConnections tab = iota
 	tabSchema
 	tabQuery
+	tabResults
+	tabHistory
 	tabHelpers
 	tabCount
 )
 
-var tabNames = [tabCount]string{"Connections", "Schema", "Query", "Helpers"}
+var tabNames = [tabCount]string{"Connections", "Browse", "Query", "Results", "History", "Helpers"}
+var primaryTabs = []tab{tabConnections, tabSchema, tabQuery, tabResults}
+
+type queryHelper struct {
+	label    string
+	template string
+	kind     string
+}
+
+type queryPickerItem struct {
+	label  string
+	detail string
+	value  string
+	kind   string
+}
+
+type columnPickerItem struct {
+	name     string
+	dataType string
+	selected bool
+}
 
 type panel int
 
@@ -32,27 +55,44 @@ const (
 
 // Async messages
 type connectedMsg struct {
-	db  db.DB
-	err error
+	reqID   int
+	connIdx int
+	conn    config.Connection
+	db      db.DB
+	err     error
 }
 type tablesLoadedMsg struct {
+	reqID  int
 	tables []string
 	err    error
 }
 type schemaLoadedMsg struct {
+	reqID  int
+	table  string
 	schema *db.TableSchema
 	err    error
 }
 type queryDoneMsg struct {
+	reqID  int
+	query  string
 	result *db.QueryResult
 	err    error
 }
 
 // New connection form field indices
 const (
-	fieldName = 0
-	fieldDSN  = 1
-	fieldCount = 2
+	fieldName = iota
+	fieldDSN
+	fieldCount
+)
+
+// New connection form focus positions.
+const (
+	newConnFocusName = iota
+	newConnFocusType
+	newConnFocusDSN
+	newConnFocusSave
+	newConnFocusCount
 )
 
 var dbTypes = []string{"sqlite", "postgres", "mongo"}
@@ -73,21 +113,30 @@ type Model struct {
 	activeConnName string
 
 	// New connection form
-	newConnInputs   [fieldCount]textinput.Model
-	newConnTypeCur  int // index into dbTypes
-	newConnFocus    int // 0=name, 1=type, 2=dsn
+	newConnInputs  [fieldCount]textinput.Model
+	newConnTypeCur int // index into dbTypes
+	newConnFocus   int // one of newConnFocus*
 
 	// Schema tab
 	tables      []string
 	tableCursor int
 	tableSchema *db.TableSchema
+	schemaTable table.Model
 
 	// Query tab
-	queryInput   textarea.Model
-	queryResult  *db.QueryResult
-	queryErr     string
-	resultScroll int
-	queryFocus   bool // true = textarea focused
+	queryInput          textarea.Model
+	queryResult         *db.QueryResult
+	queryErr            string
+	queryFocus          bool // true = textarea focused
+	resultTable         table.Model
+	resultColOffset     int
+	resultVisibleColumn int
+	queryHistory        []string
+	queryHistoryIdx     int
+	lastRunQuery        string
+
+	// History tab
+	historyCursor int
 
 	// Helpers tab
 	helperCursor int
@@ -99,10 +148,38 @@ type Model struct {
 	// Loading states
 	loading bool
 
+	connectReqID int
+	tablesReqID  int
+	schemaReqID  int
+	queryReqID   int
+
 	// Modal overlay: new connection form visible
 	showNewConn bool
 	// Modal overlay: help
 	showHelp bool
+	// Modal overlay: query picker
+	showQueryPicker   bool
+	queryPickerTitle  string
+	queryPickerItems  []queryPickerItem
+	queryPickerCursor int
+	// Modal overlay: column picker
+	showColumnPicker     bool
+	columnPickerTitle    string
+	columnPickerItems    []columnPickerItem
+	columnPickerCursor   int
+	columnPickerMulti    bool
+	columnPickerStart    int
+	columnPickerEnd      int
+	columnPickerFallback string
+	// Modal overlay: inspect selected row/value details
+	showInspect   bool
+	inspectTitle  string
+	inspectLines  []string
+	inspectCopy   string
+	inspectScroll int
+
+	// Last copied text for fallback/status purposes
+	lastCopied string
 }
 
 func newModel(cfg *config.Config) Model {
@@ -123,14 +200,26 @@ func newModel(cfg *config.Config) Model {
 	ta.SetWidth(60)
 	ta.SetHeight(6)
 
+	schemaTable := table.New()
+	schemaTable.SetStyles(newTableStyles())
+	schemaTable.Blur()
+
+	resultTable := table.New()
+	resultTable.SetStyles(newTableStyles())
+	resultTable.Blur()
+
 	return Model{
-		cfg:          cfg,
-		activeConnIdx: -1,
-		queryInput:   ta,
-		newConnInputs: inputs,
+		cfg:             cfg,
+		activeConnIdx:   -1,
+		focus:           panelLeft,
+		queryInput:      ta,
+		newConnInputs:   inputs,
+		schemaTable:     schemaTable,
+		resultTable:     resultTable,
+		queryHistoryIdx: -1,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
-	return nil
+	return tea.SetWindowTitle("dbkit")
 }

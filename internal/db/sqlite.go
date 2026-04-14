@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // SQLiteDB implements DB for SQLite.
@@ -18,7 +18,7 @@ func (d *SQLiteDB) Type() string { return "sqlite" }
 func (d *SQLiteDB) DSN() string  { return d.path }
 
 func (d *SQLiteDB) Connect() error {
-	conn, err := sql.Open("sqlite3", d.path)
+	conn, err := sql.Open("sqlite", d.path)
 	if err != nil {
 		return err
 	}

@@ -1,19 +1,697 @@
 package db
 
-import "fmt"
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 
-// MongoDB is a stub — full implementation coming soon.
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
+)
+
+const (
+	mongoConnectTimeout = 8 * time.Second
+	mongoOpTimeout      = 15 * time.Second
+	mongoSampleLimit    = int64(100)
+	mongoDefaultLimit   = int64(100)
+	mongoMaxLimit       = int64(1000)
+)
+
+// MongoDB implements DB for MongoDB.
 type MongoDB struct {
-	uri string
+	uri    string
+	dbName string
+	client *mongo.Client
+	db     *mongo.Database
 }
 
 func (d *MongoDB) Type() string { return "mongo" }
 func (d *MongoDB) DSN() string  { return d.uri }
+
 func (d *MongoDB) Connect() error {
-	return fmt.Errorf("MongoDB support coming soon — connection saved")
+	dbName, err := parseMongoDBName(d.uri)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), mongoConnectTimeout)
+	defer cancel()
+
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(d.uri))
+	if err != nil {
+		return err
+	}
+	if err := client.Ping(ctx, readpref.Primary()); err != nil {
+		_ = client.Disconnect(ctx)
+		return err
+	}
+
+	d.client = client
+	d.dbName = dbName
+	d.db = client.Database(dbName)
+	return nil
 }
-func (d *MongoDB) Close()                                         {}
-func (d *MongoDB) Ping() error                                    { return fmt.Errorf("not connected") }
-func (d *MongoDB) GetTables() ([]string, error)                   { return nil, fmt.Errorf("not connected") }
-func (d *MongoDB) GetTableSchema(t string) (*TableSchema, error)  { return nil, fmt.Errorf("not connected") }
-func (d *MongoDB) RunQuery(q string) (*QueryResult, error)        { return nil, fmt.Errorf("not connected") }
+
+func (d *MongoDB) Close() {
+	if d.client == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = d.client.Disconnect(ctx)
+	d.client = nil
+	d.db = nil
+}
+
+func (d *MongoDB) Ping() error {
+	if d.client == nil {
+		return fmt.Errorf("not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
+	defer cancel()
+	return d.client.Ping(ctx, readpref.Primary())
+}
+
+func (d *MongoDB) GetTables() ([]string, error) {
+	if d.db == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
+	defer cancel()
+
+	names, err := d.db.ListCollectionNames(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func (d *MongoDB) GetTableSchema(collection string) (*TableSchema, error) {
+	if d.db == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	coll := d.db.Collection(collection)
+
+	ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
+	defer cancel()
+
+	rowCount, err := coll.CountDocuments(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+
+	findOpts := options.Find().SetLimit(mongoSampleLimit)
+	cur, err := coll.Find(ctx, bson.D{}, findOpts)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+
+	type fieldStat struct {
+		types map[string]struct{}
+		seen  int
+	}
+	stats := map[string]*fieldStat{}
+	samples := 0
+
+	for cur.Next(ctx) {
+		samples++
+		var doc bson.M
+		if err := cur.Decode(&doc); err != nil {
+			return nil, err
+		}
+		for key, val := range doc {
+			fs, ok := stats[key]
+			if !ok {
+				fs = &fieldStat{types: map[string]struct{}{}}
+				stats[key] = fs
+			}
+			fs.seen++
+			fs.types[mongoTypeName(val)] = struct{}{}
+		}
+	}
+	if err := cur.Err(); err != nil {
+		return nil, err
+	}
+
+	schema := &TableSchema{Name: collection, RowCount: rowCount}
+	if len(stats) == 0 {
+		return schema, nil
+	}
+
+	keys := make([]string, 0, len(stats))
+	for key := range stats {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	// Keep Mongo's primary key first for consistency.
+	if contains(keys, "_id") {
+		keys = append([]string{"_id"}, remove(keys, "_id")...)
+	}
+
+	for _, key := range keys {
+		fs := stats[key]
+		typeName := "unknown"
+		if len(fs.types) == 1 {
+			for t := range fs.types {
+				typeName = t
+			}
+		} else if len(fs.types) > 1 {
+			typeName = "mixed"
+		}
+
+		schema.Columns = append(schema.Columns, ColumnInfo{
+			Name:       key,
+			Type:       typeName,
+			Nullable:   fs.seen < samples,
+			PrimaryKey: key == "_id",
+		})
+	}
+
+	return schema, nil
+}
+
+func (d *MongoDB) RunQuery(query string) (*QueryResult, error) {
+	if d.db == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+
+	cmd, rest := nextWord(query)
+	cmd = strings.ToLower(cmd)
+	switch cmd {
+	case "":
+		return nil, fmt.Errorf("empty query")
+	case "help":
+		return &QueryResult{Message: mongoHelp()}, nil
+	case "collections", "show":
+		names, err := d.GetTables()
+		if err != nil {
+			return nil, err
+		}
+		rows := make([][]string, 0, len(names))
+		for _, n := range names {
+			rows = append(rows, []string{n})
+		}
+		return &QueryResult{Columns: []string{"collection"}, Rows: rows}, nil
+	case "find":
+		return d.runFind(rest)
+	case "aggregate", "agg":
+		return d.runAggregate(rest)
+	case "count":
+		return d.runCount(rest)
+	case "insert":
+		return d.runInsert(rest)
+	case "update":
+		return d.runUpdate(rest)
+	case "delete", "remove":
+		return d.runDelete(rest)
+	default:
+		return nil, fmt.Errorf("unknown mongo command %q. run 'help'", cmd)
+	}
+}
+
+func (d *MongoDB) runFind(rest string) (*QueryResult, error) {
+	collection, tail := nextWord(rest)
+	if collection == "" {
+		return nil, fmt.Errorf("usage: find <collection> [filter-json] [limit] [sort-json]")
+	}
+
+	filter := bson.M{}
+	limit := mongoDefaultLimit
+	var sort bson.D
+	tail = strings.TrimSpace(tail)
+
+	// Optional filter JSON.
+	if startsWithJSON(tail) {
+		jsonArg, remaining, err := extractJSONArg(tail)
+		if err != nil {
+			return nil, fmt.Errorf("invalid filter json: %w", err)
+		}
+		if err := bson.UnmarshalExtJSON([]byte(jsonArg), true, &filter); err != nil {
+			return nil, fmt.Errorf("invalid filter json: %w", err)
+		}
+		tail = strings.TrimSpace(remaining)
+	}
+
+	// Optional limit (any bare integer).
+	if tail != "" && !startsWithJSON(tail) {
+		word, remaining := nextWord(tail)
+		n, err := strconv.ParseInt(word, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid limit: %w", err)
+		}
+		if n > 0 {
+			limit = n
+		}
+		tail = strings.TrimSpace(remaining)
+	}
+
+	// Optional sort JSON (object of field->1/-1).
+	if startsWithJSON(tail) {
+		jsonArg, _, err := extractJSONArg(tail)
+		if err != nil {
+			return nil, fmt.Errorf("invalid sort json: %w", err)
+		}
+		if err := bson.UnmarshalExtJSON([]byte(jsonArg), true, &sort); err != nil {
+			return nil, fmt.Errorf("invalid sort json: %w", err)
+		}
+	}
+
+	if limit > mongoMaxLimit {
+		limit = mongoMaxLimit
+	}
+
+	findOpts := options.Find().SetLimit(limit)
+	if len(sort) > 0 {
+		findOpts.SetSort(sort)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
+	defer cancel()
+	cur, err := d.db.Collection(collection).Find(ctx, filter, findOpts)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+
+	var docs []bson.M
+	if err := cur.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+	return docsToQueryResult(docs), nil
+}
+
+func (d *MongoDB) runAggregate(rest string) (*QueryResult, error) {
+	collection, tail := nextWord(rest)
+	if collection == "" {
+		return nil, fmt.Errorf("usage: aggregate <collection> <pipeline-json-array>")
+	}
+	tail = strings.TrimSpace(tail)
+	if tail == "" {
+		return nil, fmt.Errorf("missing pipeline json")
+	}
+
+	pipelineJSON, _, err := extractJSONArg(tail)
+	if err != nil {
+		return nil, err
+	}
+
+	var pipeline []bson.D
+	if err := bson.UnmarshalExtJSON([]byte(pipelineJSON), true, &pipeline); err != nil {
+		return nil, fmt.Errorf("invalid pipeline json: %w", err)
+	}
+	stages := make(mongo.Pipeline, 0, len(pipeline))
+	for _, stage := range pipeline {
+		stages = append(stages, stage)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
+	defer cancel()
+	cur, err := d.db.Collection(collection).Aggregate(ctx, stages)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+
+	var docs []bson.M
+	if err := cur.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+	return docsToQueryResult(docs), nil
+}
+
+func (d *MongoDB) runCount(rest string) (*QueryResult, error) {
+	collection, tail := nextWord(rest)
+	if collection == "" {
+		return nil, fmt.Errorf("usage: count <collection> [filter-json]")
+	}
+	filter := bson.M{}
+	tail = strings.TrimSpace(tail)
+	if tail != "" {
+		if !startsWithJSON(tail) {
+			return nil, fmt.Errorf("invalid filter json")
+		}
+		jsonArg, _, err := extractJSONArg(tail)
+		if err != nil {
+			return nil, err
+		}
+		if err := bson.UnmarshalExtJSON([]byte(jsonArg), true, &filter); err != nil {
+			return nil, fmt.Errorf("invalid filter json: %w", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
+	defer cancel()
+	n, err := d.db.Collection(collection).CountDocuments(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	return &QueryResult{Columns: []string{"count"}, Rows: [][]string{{strconv.FormatInt(n, 10)}}}, nil
+}
+
+func (d *MongoDB) runInsert(rest string) (*QueryResult, error) {
+	collection, tail := nextWord(rest)
+	if collection == "" {
+		return nil, fmt.Errorf("usage: insert <collection> <document-json>")
+	}
+	tail = strings.TrimSpace(tail)
+	if !startsWithJSON(tail) {
+		return nil, fmt.Errorf("missing document json")
+	}
+	jsonArg, _, err := extractJSONArg(tail)
+	if err != nil {
+		return nil, err
+	}
+
+	var doc bson.M
+	if err := bson.UnmarshalExtJSON([]byte(jsonArg), true, &doc); err != nil {
+		return nil, fmt.Errorf("invalid document json: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
+	defer cancel()
+	res, err := d.db.Collection(collection).InsertOne(ctx, doc)
+	if err != nil {
+		return nil, err
+	}
+	return &QueryResult{Message: fmt.Sprintf("inserted _id=%s", formatMongoValue(res.InsertedID))}, nil
+}
+
+func (d *MongoDB) runUpdate(rest string) (*QueryResult, error) {
+	collection, tail := nextWord(rest)
+	if collection == "" {
+		return nil, fmt.Errorf("usage: update <collection> <filter-json> <update-json> [many]")
+	}
+	tail = strings.TrimSpace(tail)
+
+	filterJSON, remaining, err := extractJSONArg(tail)
+	if err != nil {
+		return nil, fmt.Errorf("missing/invalid filter json: %w", err)
+	}
+	updateJSON, remaining, err := extractJSONArg(strings.TrimSpace(remaining))
+	if err != nil {
+		return nil, fmt.Errorf("missing/invalid update json: %w", err)
+	}
+	many := strings.EqualFold(strings.TrimSpace(remaining), "many")
+
+	var filter bson.M
+	if err := bson.UnmarshalExtJSON([]byte(filterJSON), true, &filter); err != nil {
+		return nil, fmt.Errorf("invalid filter json: %w", err)
+	}
+	var update bson.M
+	if err := bson.UnmarshalExtJSON([]byte(updateJSON), true, &update); err != nil {
+		return nil, fmt.Errorf("invalid update json: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
+	defer cancel()
+	if many {
+		res, err := d.db.Collection(collection).UpdateMany(ctx, filter, update)
+		if err != nil {
+			return nil, err
+		}
+		return &QueryResult{Message: fmt.Sprintf("matched=%d modified=%d", res.MatchedCount, res.ModifiedCount)}, nil
+	}
+	res, err := d.db.Collection(collection).UpdateOne(ctx, filter, update)
+	if err != nil {
+		return nil, err
+	}
+	return &QueryResult{Message: fmt.Sprintf("matched=%d modified=%d", res.MatchedCount, res.ModifiedCount)}, nil
+}
+
+func (d *MongoDB) runDelete(rest string) (*QueryResult, error) {
+	collection, tail := nextWord(rest)
+	if collection == "" {
+		return nil, fmt.Errorf("usage: delete <collection> <filter-json> [many]")
+	}
+	tail = strings.TrimSpace(tail)
+
+	filterJSON, remaining, err := extractJSONArg(tail)
+	if err != nil {
+		return nil, fmt.Errorf("missing/invalid filter json: %w", err)
+	}
+	many := strings.EqualFold(strings.TrimSpace(remaining), "many")
+
+	var filter bson.M
+	if err := bson.UnmarshalExtJSON([]byte(filterJSON), true, &filter); err != nil {
+		return nil, fmt.Errorf("invalid filter json: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
+	defer cancel()
+	if many {
+		res, err := d.db.Collection(collection).DeleteMany(ctx, filter)
+		if err != nil {
+			return nil, err
+		}
+		return &QueryResult{Message: fmt.Sprintf("deleted=%d", res.DeletedCount)}, nil
+	}
+	res, err := d.db.Collection(collection).DeleteOne(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	return &QueryResult{Message: fmt.Sprintf("deleted=%d", res.DeletedCount)}, nil
+}
+
+func parseMongoDBName(uri string) (string, error) {
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return "", errors.New("mongodb dsn is empty")
+	}
+
+	schemeIdx := strings.Index(uri, "://")
+	if schemeIdx == -1 {
+		return "", errors.New("invalid mongodb dsn")
+	}
+	rest := uri[schemeIdx+3:]
+	slash := strings.Index(rest, "/")
+	if slash == -1 {
+		return "", errors.New("mongodb dsn must include a database name")
+	}
+	path := rest[slash+1:]
+	if q := strings.Index(path, "?"); q >= 0 {
+		path = path[:q]
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", errors.New("mongodb dsn must include a database name")
+	}
+	if strings.Contains(path, "/") {
+		path = strings.Split(path, "/")[0]
+	}
+	if path == "" {
+		return "", errors.New("mongodb dsn must include a database name")
+	}
+	return path, nil
+}
+
+func nextWord(s string) (word, rest string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", ""
+	}
+	idx := strings.IndexAny(s, " \t\n")
+	if idx == -1 {
+		return s, ""
+	}
+	return s[:idx], strings.TrimSpace(s[idx+1:])
+}
+
+func startsWithJSON(s string) bool {
+	s = strings.TrimSpace(s)
+	return strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[")
+}
+
+func extractJSONArg(s string) (jsonArg, rest string, err error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", "", errors.New("empty argument")
+	}
+	start := rune(s[0])
+	var end rune
+	switch start {
+	case '{':
+		end = '}'
+	case '[':
+		end = ']'
+	default:
+		return "", "", errors.New("expected json object or array")
+	}
+
+	depth := 0
+	inString := false
+	escaped := false
+	for i, r := range s {
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if r == '\\' {
+				escaped = true
+				continue
+			}
+			if r == '"' {
+				inString = false
+			}
+			continue
+		}
+
+		if r == '"' {
+			inString = true
+			continue
+		}
+		if r == start {
+			depth++
+		}
+		if r == end {
+			depth--
+			if depth == 0 {
+				return s[:i+1], strings.TrimSpace(s[i+1:]), nil
+			}
+		}
+	}
+	return "", "", errors.New("unterminated json argument")
+}
+
+func docsToQueryResult(docs []bson.M) *QueryResult {
+	if len(docs) == 0 {
+		return &QueryResult{Columns: []string{"result"}, Rows: [][]string{}}
+	}
+
+	keySet := map[string]struct{}{}
+	for _, doc := range docs {
+		for k := range doc {
+			keySet[k] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(keySet))
+	for k := range keySet {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if contains(keys, "_id") {
+		keys = append([]string{"_id"}, remove(keys, "_id")...)
+	}
+
+	rows := make([][]string, 0, len(docs))
+	for _, doc := range docs {
+		row := make([]string, len(keys))
+		for i, k := range keys {
+			row[i] = formatMongoValue(doc[k])
+		}
+		rows = append(rows, row)
+	}
+
+	return &QueryResult{Columns: keys, Rows: rows}
+}
+
+func mongoTypeName(v interface{}) string {
+	switch t := v.(type) {
+	case nil:
+		return "null"
+	case string:
+		return "string"
+	case bool:
+		return "bool"
+	case int, int8, int16, int32, int64:
+		return "int"
+	case uint, uint8, uint16, uint32, uint64:
+		return "uint"
+	case float32, float64:
+		return "float"
+	case primitive.ObjectID:
+		return "objectId"
+	case primitive.DateTime, time.Time:
+		return "date"
+	case primitive.Decimal128:
+		return "decimal"
+	case primitive.Binary:
+		return "binary"
+	case []interface{}:
+		return "array"
+	case map[string]interface{}, bson.M:
+		return "object"
+	case bson.D:
+		return "document"
+	case primitive.Null:
+		return "null"
+	default:
+		_ = t
+		return fmt.Sprintf("%T", v)
+	}
+}
+
+func formatMongoValue(v interface{}) string {
+	switch t := v.(type) {
+	case nil:
+		return "NULL"
+	case primitive.ObjectID:
+		return t.Hex()
+	case primitive.DateTime:
+		return t.Time().Format(time.RFC3339)
+	case time.Time:
+		return t.Format(time.RFC3339)
+	case primitive.D:
+		m := t.Map()
+		b, err := bson.MarshalExtJSON(m, false, false)
+		if err == nil {
+			return string(b)
+		}
+		return fmt.Sprintf("%v", m)
+	case bson.M, []interface{}:
+		b, err := bson.MarshalExtJSON(t, false, false)
+		if err == nil {
+			return string(b)
+		}
+		return fmt.Sprintf("%v", t)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func contains(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
+func remove(items []string, target string) []string {
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		if item != target {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func mongoHelp() string {
+	return strings.Join([]string{
+		"Mongo commands:",
+		"find <collection> [filter-json] [limit] [sort-json]",
+		"aggregate <collection> <pipeline-json-array>",
+		"count <collection> [filter-json]",
+		"insert <collection> <document-json>",
+		"update <collection> <filter-json> <update-json> [many]",
+		"delete <collection> <filter-json> [many]",
+		"collections",
+		"",
+		`examples:`,
+		`  find users {} 50`,
+		`  find users {"status":"active"} 20 {"created_at":-1}`,
+		`  aggregate orders [{"$match":{"paid":true}},{"$group":{"_id":"$sku","n":{"$sum":1}}}]`,
+	}, "\n")
+}
