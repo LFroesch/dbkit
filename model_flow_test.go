@@ -72,7 +72,7 @@ func TestEditorEscReturnsFocusToResultsPane(t *testing.T) {
 func TestSchemaRightPaneCIgnored(t *testing.T) {
 	m := newModel(&config.Config{})
 	m.activeDB = &fakeDB{dbType: "sqlite"}
-	m.activeTab = tabSchema
+	m.activeTab = tabBrowse
 	m.focus = panelRight
 	m.tableSchema = &db.TableSchema{
 		Name: "users",
@@ -117,7 +117,7 @@ func TestRenderSchemaDetailUsesBubbleTable(t *testing.T) {
 	}
 	m.resizeTables()
 
-	view := stripANSIForTest(m.renderSchemaDetail(64, 16))
+	view := stripANSIForTest(m.renderBrowseDetail(64, 16))
 	if !strings.Contains(view, "Column") || !strings.Contains(view, "Type") || !strings.Contains(view, "Flags") {
 		t.Fatalf("expected schema detail to include table headers, got %q", view)
 	}
@@ -128,7 +128,7 @@ func TestRenderSchemaDetailUsesBubbleTable(t *testing.T) {
 	if !strings.Contains(view, tableView) {
 		t.Fatalf("expected schema detail to embed schema table view")
 	}
-	if got := strings.Count(m.renderSchemaDetail(64, 16), "\n") + 1; got > 16 {
+	if got := strings.Count(m.renderBrowseDetail(64, 16), "\n") + 1; got > 16 {
 		t.Fatalf("schema detail rendered %d lines, want <= 16", got)
 	}
 }
@@ -181,7 +181,7 @@ func TestBrowseViewStaysWithinWindowHeight(t *testing.T) {
 	m.width = 120
 	m.height = 24
 	m.activeDB = &fakeDB{dbType: "sqlite"}
-	m.activeTab = tabSchema
+	m.activeTab = tabBrowse
 	m.focus = panelRight
 	m.activeConnName = "main"
 	m.tables = []string{"users", "orders"}
@@ -380,7 +380,7 @@ func TestTabOpensColumnPickerFromQueryEditor(t *testing.T) {
 	}
 }
 
-func TestTypingInQueryEditorDoesNotAutoOpenCompletionPicker(t *testing.T) {
+func TestTypingInQueryEditorAutoOpensCompletionPicker(t *testing.T) {
 	m := newModel(&config.Config{})
 	m.activeDB = &fakeDB{dbType: "sqlite"}
 	m.activeTab = tabQuery
@@ -397,12 +397,16 @@ func TestTypingInQueryEditorDoesNotAutoOpenCompletionPicker(t *testing.T) {
 		},
 	}
 	m.queryInput.SetValue("SELECT")
+	m.queryInput.CursorEnd()
 
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
 	got := next.(Model)
 
-	if got.showColumnPicker {
-		t.Fatalf("expected completion picker to stay closed until requested")
+	if !got.showColumnPicker {
+		t.Fatalf("expected completion picker to open while typing in context")
+	}
+	if len(got.columnPickerItems) == 0 {
+		t.Fatalf("expected completion items while typing")
 	}
 }
 
@@ -414,7 +418,6 @@ func TestCtrlLClearsQueryEditor(t *testing.T) {
 	m.queryFocus = true
 	m.queryInput.Focus()
 	m.queryInput.SetValue("SELECT * FROM users;")
-	m.snippetPlaceholders = []snippetPlaceholder{{name: "table", start: 14, end: 19, fresh: true}}
 	m.queryHistoryIdx = 1
 
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlL})
@@ -423,11 +426,38 @@ func TestCtrlLClearsQueryEditor(t *testing.T) {
 	if got.queryInput.Value() != "" {
 		t.Fatalf("query input = %q, want empty", got.queryInput.Value())
 	}
-	if len(got.snippetPlaceholders) != 0 {
-		t.Fatalf("expected snippet placeholders to clear")
-	}
 	if got.queryHistoryIdx != -1 {
 		t.Fatalf("queryHistoryIdx = %d, want -1", got.queryHistoryIdx)
+	}
+}
+
+func TestCtrlLClearsQueryEditorWhileCompletionPopoverIsOpen(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users"}
+	m.tableSchema = &db.TableSchema{
+		Name:    "users",
+		Columns: []db.ColumnInfo{{Name: "id", Type: "integer"}},
+	}
+	m.queryInput.SetValue("SELECT ")
+	setTextareaCursor(&m.queryInput, 0, len("SELECT "))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected completion picker to open")
+	}
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlL})
+	got := next.(Model)
+
+	if got.queryInput.Value() != "" {
+		t.Fatalf("query input = %q, want empty", got.queryInput.Value())
+	}
+	if got.showColumnPicker {
+		t.Fatalf("expected completion picker to close after clear")
 	}
 }
 
@@ -552,7 +582,7 @@ func TestColumnPickerInsertsColumnsAtCursor(t *testing.T) {
 	m.queryInput.SetValue(`SELECT  FROM "users";`)
 	setTextareaCursor(&m.queryInput, 0, len("SELECT "))
 
-	if !m.openCompletionForCursor(true) {
+	if ok, _ := m.openCompletionForCursor(true); !ok {
 		t.Fatalf("expected column picker to open")
 	}
 	for i := range m.columnPickerItems {
@@ -561,7 +591,7 @@ func TestColumnPickerInsertsColumnsAtCursor(t *testing.T) {
 		}
 	}
 
-	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyEnter})
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
 	got := next.(Model)
 
 	want := `SELECT "email", "created_at" FROM "users";`
@@ -617,7 +647,32 @@ func TestMongoCompletionStartsWithCommandSuggestions(t *testing.T) {
 	}
 }
 
-func TestSnippetCompletionCreatesPlaceholderSession(t *testing.T) {
+func TestMongoFindCompletionInsertsLiteralQuery(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users"}
+	m.tableCursor = 0
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected completion picker to open")
+	}
+	if m.columnPickerItems[0].label != "find" {
+		t.Fatalf("top suggestion = %q, want find", m.columnPickerItems[0].label)
+	}
+
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+
+	if got.queryInput.Value() != "db.users.find({})" {
+		t.Fatalf("query input = %q, want shell-format find starter", got.queryInput.Value())
+	}
+}
+
+func TestStarterCompletionInsertsLiteralQuery(t *testing.T) {
 	m := newModel(&config.Config{})
 	m.activeDB = &fakeDB{dbType: "sqlite"}
 	m.activeTab = tabQuery
@@ -634,42 +689,120 @@ func TestSnippetCompletionCreatesPlaceholderSession(t *testing.T) {
 		},
 	}
 
-	if !m.openCompletionForCursor(true) {
+	if ok, _ := m.openCompletionForCursor(true); !ok {
 		t.Fatalf("expected completion picker to open")
 	}
 	m.columnPickerCursor = 0
 
-	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyEnter})
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
 	got := next.(Model)
 
-	if len(got.snippetPlaceholders) == 0 {
-		t.Fatalf("expected snippet placeholders to be active")
-	}
-	if !strings.Contains(got.queryInput.Value(), "${columns}") {
-		t.Fatalf("expected snippet text in query input, got %q", got.queryInput.Value())
+	if got.queryInput.Value() != "SELECT *\nFROM \"users\"\nLIMIT 50;" {
+		t.Fatalf("expected literal starter query, got %q", got.queryInput.Value())
 	}
 }
 
-func TestTabJumpsSnippetPlaceholders(t *testing.T) {
+func TestTabWithoutCompletionDoesNotEnterSnippetMode(t *testing.T) {
 	m := newModel(&config.Config{})
 	m.activeDB = &fakeDB{dbType: "sqlite"}
 	m.activeTab = tabQuery
 	m.focus = panelRight
 	m.queryFocus = true
 	m.queryInput.Focus()
-	m.queryInput.SetValue("SELECT ${columns} FROM ${table};")
-	m.snippetPlaceholders = []snippetPlaceholder{
-		{name: "columns", start: len("SELECT "), end: len("SELECT ${columns}"), fresh: true},
-		{name: "table", start: len("SELECT ${columns} FROM "), end: len("SELECT ${columns} FROM ${table}"), fresh: true},
+	m.tables = []string{"users"}
+	m.tableCursor = 0
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "id", Type: "integer"},
+			{Name: "email", Type: "text"},
+		},
 	}
-	m.snippetIndex = 0
-	m.focusSnippetPlaceholder(0)
+	m.queryInput.SetValue(`SELECT * FROM "users";`)
+	setTextareaCursor(&m.queryInput, 0, len(`SELECT * FROM "users";`))
 
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
 	got := next.(Model)
 
-	if got.snippetIndex != 1 {
-		t.Fatalf("snippet index = %d, want 1", got.snippetIndex)
+	if got.showColumnPicker {
+		t.Fatalf("expected no completion picker in neutral query position")
+	}
+}
+
+func TestLimitContextSuggestsNumericValues(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.queryInput.SetValue("SELECT * FROM users LIMIT ")
+	setTextareaCursor(&m.queryInput, 0, len("SELECT * FROM users LIMIT "))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected limit completion to open")
+	}
+	if m.columnPickerTitle != "Limit" {
+		t.Fatalf("picker title = %q, want Limit", m.columnPickerTitle)
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["50"] || !found["100"] {
+		t.Fatalf("expected numeric suggestions, got %v", found)
+	}
+}
+
+func TestInsertValuesContextStaysFreeForm(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.queryInput.SetValue(`INSERT INTO "users" ("email") VALUES (`)
+	setTextareaCursor(&m.queryInput, 0, len(`INSERT INTO "users" ("email") VALUES (`))
+
+	if ok, _ := m.openCompletionForCursor(true); ok {
+		t.Fatalf("expected values context to stay free-form, got picker %#v", m.columnPickerItems)
+	}
+}
+
+func TestMongoSortContextOpensAfterLiteralFilterAndLimit(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeConnIdx = 0
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "status", Type: "string"},
+			{Name: "created_at", Type: "date"},
+		},
+	}
+	query := `find users {} 50 `
+	m.queryInput.SetValue(query)
+	setTextareaCursor(&m.queryInput, 0, len(query))
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+
+	if !got.showColumnPicker {
+		t.Fatalf("expected sort completion picker to open")
+	}
+	if got.columnPickerTitle != "Sort" {
+		t.Fatalf("picker title = %q, want Sort", got.columnPickerTitle)
+	}
+	found := map[string]bool{}
+	for _, item := range got.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["created_at desc"] || !found["status asc"] {
+		t.Fatalf("expected sort suggestions, got %v", found)
 	}
 }
 
@@ -740,27 +873,57 @@ func TestSaveCurrentQueryPersistsToConfig(t *testing.T) {
 	}
 }
 
-func TestBrowseEnterRunsDefaultQueryIntoResults(t *testing.T) {
+func TestSubmitNewConnEditsExistingConnection(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfg := &config.Config{
+		Connections: []config.Connection{{ID: "abc123", Name: "main", Type: "sqlite", DSN: "test.db"}},
+	}
+	m := newModel(cfg)
+	m.openEditConnForm(0)
+	m.newConnInputs[fieldName].SetValue("warehouse")
+	m.newConnTypeCur = indexOfString(dbTypes, "postgres")
+	m.newConnInputs[fieldDSN].SetValue("postgres://user:pass@localhost:5432/warehouse")
+
+	next, _ := m.submitNewConn()
+	got := next.(Model)
+
+	if len(got.cfg.Connections) != 1 {
+		t.Fatalf("connections = %d, want 1", len(got.cfg.Connections))
+	}
+	if got.cfg.Connections[0].Name != "warehouse" {
+		t.Fatalf("connection name = %q, want warehouse", got.cfg.Connections[0].Name)
+	}
+	if got.cfg.Connections[0].Type != "postgres" {
+		t.Fatalf("connection type = %q, want postgres", got.cfg.Connections[0].Type)
+	}
+	if got.newConnEditIdx != -1 {
+		t.Fatalf("newConnEditIdx = %d, want -1", got.newConnEditIdx)
+	}
+}
+
+func TestBrowseEnterSwitchesToDataView(t *testing.T) {
 	m := newModel(&config.Config{})
 	m.activeDB = &fakeDB{dbType: "sqlite"}
-	m.activeTab = tabSchema
+	m.activeTab = tabBrowse
 	m.tables = []string{"users"}
 	m.tableCursor = 0
 
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	got := next.(Model)
 
-	if got.activeTab != tabResults {
-		t.Fatalf("active tab = %v, want results tab", got.activeTab)
+	if got.activeTab != tabBrowse {
+		t.Fatalf("active tab = %v, want browse tab", got.activeTab)
 	}
-	if !got.loading {
-		t.Fatalf("expected loading state after browse enter")
+	if got.browseView != browseViewData {
+		t.Fatalf("browse view = %v, want data view", got.browseView)
 	}
-	if got.queryInput.Value() != `SELECT * FROM "users" LIMIT 100;` {
-		t.Fatalf("query input = %q", got.queryInput.Value())
+	if got.focus != panelRight {
+		t.Fatalf("focus = %v, want right panel", got.focus)
 	}
 	if cmd == nil {
-		t.Fatalf("expected query command to run")
+		t.Fatalf("expected browse data load command")
 	}
 }
 
@@ -794,6 +957,25 @@ func TestResultsTabResetsToFirstRowAndColumn(t *testing.T) {
 	}
 	if got.resultTable.Cursor() != 0 {
 		t.Fatalf("result row cursor = %d, want 0", got.resultTable.Cursor())
+	}
+}
+
+func TestResultsTabQNavigatesBackEvenIfQueryFocusIsStale(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabResults
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	got := next.(Model)
+
+	if got.activeTab != tabQuery {
+		t.Fatalf("active tab = %v, want query tab", got.activeTab)
+	}
+	if !got.queryFocus {
+		t.Fatalf("expected query editor to be focused after navigating back")
 	}
 }
 
@@ -851,6 +1033,961 @@ func TestDataSourceLabelUsesCollectionsForMongo(t *testing.T) {
 	}
 	if got := m.dataSourceLabelPlural(); got != "collections" {
 		t.Fatalf("plural label = %q, want collections", got)
+	}
+}
+
+func TestCompletionSuppressedInsideStringLiteral(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users"}
+	m.tableCursor = 0
+	// No matching column before the quote so value-completion is also skipped.
+	m.queryInput.SetValue(`SELECT 'abc`)
+	setTextareaCursor(&m.queryInput, 0, len(`SELECT 'abc`))
+
+	ok, _ := m.openCompletionForCursor(true)
+	if ok {
+		t.Fatalf("expected completion to be suppressed inside string literal, but picker opened with items: %#v", m.columnPickerItems)
+	}
+}
+
+func TestSQLKeywordCompletionIncludesTablesWhenEmpty(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users", "orders"}
+	m.tableCursor = 0
+	m.queryInput.SetValue("")
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected completion picker to open on empty editor")
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["users"] || !found["orders"] {
+		t.Fatalf("expected table names as starters, got %v", found)
+	}
+}
+
+func TestValueCompletionUsesCachedSamples(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users"}
+	m.tableCursor = 0
+	m.tableSchema = &db.TableSchema{
+		Name:    "users",
+		Columns: []db.ColumnInfo{{Name: "email", Type: "text"}},
+	}
+	key := columnValueKey(m.activeConnIdx, "users", "email")
+	m.columnValueCache[key] = []string{"a@x.com", "b@x.com"}
+	m.queryInput.SetValue(`SELECT * FROM users WHERE email = '`)
+	setTextareaCursor(&m.queryInput, 0, len(`SELECT * FROM users WHERE email = '`))
+
+	ok, _ := m.openCompletionForCursor(true)
+	if !ok {
+		t.Fatalf("expected value completion to open")
+	}
+	if m.columnPickerTitle != "Values for email" {
+		t.Fatalf("title = %q, want Values for email", m.columnPickerTitle)
+	}
+	labels := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		labels[item.label] = true
+	}
+	if !labels["a@x.com"] || !labels["b@x.com"] {
+		t.Fatalf("expected cached sample values, got %v", labels)
+	}
+}
+
+func TestSQLOperatorCompletionOffersComparisonAndNullChecks(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.queryInput.SetValue(`SELECT * FROM users WHERE email `)
+	setTextareaCursor(&m.queryInput, 0, len(`SELECT * FROM users WHERE email `))
+
+	ok, _ := m.openCompletionForCursor(true)
+	if !ok {
+		t.Fatalf("expected operator completion to open")
+	}
+	if m.columnPickerTitle != "Operator" {
+		t.Fatalf("title = %q, want Operator", m.columnPickerTitle)
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["IS NULL"] || !found[">="] || !found["LIKE"] {
+		t.Fatalf("expected operator suggestions, got %v", found)
+	}
+}
+
+func TestEnterKeepsEditingWhenCompletionPopoverIsOpen(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users"}
+	m.tableSchema = &db.TableSchema{
+		Name:    "users",
+		Columns: []db.ColumnInfo{{Name: "email", Type: "text"}},
+	}
+	m.queryInput.SetValue(`SELECT `)
+	setTextareaCursor(&m.queryInput, 0, len(`SELECT `))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected completion picker to open")
+	}
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyEnter})
+	got := next.(Model)
+
+	if !got.showColumnPicker {
+		t.Fatalf("expected completion popover to stay open while editing")
+	}
+	if got.queryInput.Value() != "SELECT \n" {
+		t.Fatalf("query input = %q, want newline insertion", got.queryInput.Value())
+	}
+}
+
+func TestStarterInsertionDoesNotCreateSnippetSessionHint(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users"}
+	m.tableCursor = 0
+	m.tableSchema = &db.TableSchema{
+		Name:    "users",
+		Columns: []db.ColumnInfo{{Name: "id", Type: "integer"}},
+	}
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected completion picker to open")
+	}
+	// Find the SELECT starter and select it.
+	for i, item := range m.columnPickerItems {
+		if item.label == "SELECT starter" {
+			m.columnPickerCursor = i
+			break
+		}
+	}
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	_ = next.(Model)
+}
+
+func TestInlineCompletionPopoverKeepsEditorVisible(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.width = 120
+	m.height = 40
+	m.cfg = &config.Config{}
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users", "orders"}
+	m.tableCursor = 0
+	m.queryInput.SetValue("SELECT * FROM ")
+	setTextareaCursor(&m.queryInput, 0, len("SELECT * FROM "))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected completion picker to open")
+	}
+	rendered := stripANSIForTest(m.View())
+	if !strings.Contains(rendered, "SELECT * FROM") {
+		t.Fatalf("expected editor content visible alongside popover, got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "From Table") {
+		t.Fatalf("expected popover title rendered inline, got:\n%s", rendered)
+	}
+}
+
+func TestMongoCommandCompletionDoesNotOfferHelp(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users"}
+	m.tableCursor = 0
+	m.queryInput.SetValue("")
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected mongo completion picker to open")
+	}
+	for _, item := range m.columnPickerItems {
+		if item.label == "help" {
+			t.Fatalf("unexpected help completion item: %#v", item)
+		}
+	}
+}
+
+func TestLimitClauseSuggestsNumericValues(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.queryInput.SetValue("SELECT * FROM users LIMIT ")
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected limit completion picker to open")
+	}
+	if m.columnPickerTitle != "Limit" {
+		t.Fatalf("picker title = %q, want Limit", m.columnPickerTitle)
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["50"] || !found["100"] {
+		t.Fatalf("expected numeric limit suggestions, got %v", found)
+	}
+}
+
+func TestOrderByDirectionSuggestionAfterColumn(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.queryInput.SetValue(`SELECT * FROM "users" ORDER BY "created_at" `)
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected order direction completion picker to open")
+	}
+	if m.columnPickerTitle != "Order Direction" {
+		t.Fatalf("picker title = %q, want Order Direction", m.columnPickerTitle)
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["ASC"] || !found["DESC"] {
+		t.Fatalf("expected ASC/DESC suggestions, got %v", found)
+	}
+}
+
+func TestTemplateSelectionAutoOpensPlaceholderCompletion(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users"}
+	m.tableCursor = 0
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "id", Type: "integer"},
+			{Name: "email", Type: "text"},
+		},
+	}
+	m.queryPickerItems = []queryPickerItem{
+		{label: "Template", value: `SELECT * FROM "users" WHERE `, kind: ""},
+	}
+	m.showQueryPicker = true
+
+	next, _ := m.updateQueryPicker(tea.KeyMsg{Type: tea.KeyEnter})
+	got := next.(Model)
+	if !got.showColumnPicker {
+		t.Fatalf("expected completion picker to auto-open after loading template")
+	}
+	if got.columnPickerTitle != "Operator" {
+		t.Fatalf("picker title = %q, want Operator", got.columnPickerTitle)
+	}
+}
+
+func TestMongoFilterJSONSuggestsSchemaFields(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "status", Type: "string"},
+			{Name: "email", Type: "string"},
+		},
+	}
+	m.queryInput.SetValue(`find users {`)
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected mongo filter completion to open")
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["status"] || !found["email"] {
+		t.Fatalf("expected schema field suggestions, got %v", found)
+	}
+}
+
+func TestMongoFilterJSONSuggestsTopLevelOperators(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "status", Type: "string"},
+		},
+	}
+	m.queryInput.SetValue(`find users {`)
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected mongo filter completion to open")
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["$or"] || !found["$and"] {
+		t.Fatalf("expected top-level operator suggestions, got %v", found)
+	}
+}
+
+func TestMongoFieldCompletionReplacesOnlyCurrentKey(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "email", Type: "string"},
+			{Name: "status", Type: "string"},
+		},
+	}
+	query := `find users {"em"}`
+	m.queryInput.SetValue(query)
+	setTextareaCursor(&m.queryInput, 0, len(`find users {"em`))
+
+	ok, _ := m.openCompletionForCursor(true)
+	if !ok {
+		t.Fatalf("expected mongo field completion to open")
+	}
+	found := false
+	for i, item := range m.columnPickerItems {
+		if item.label == "email" {
+			m.columnPickerCursor = i
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected email suggestion, got %#v", m.columnPickerItems)
+	}
+
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+	want := `find users {"email":""}`
+	if got.queryInput.Value() != want {
+		t.Fatalf("query input = %q, want %q", got.queryInput.Value(), want)
+	}
+}
+
+func TestMongoUpdateOperatorCompletionPreservesSurroundingObject(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	query := `update users {} {"$s"}`
+	m.queryInput.SetValue(query)
+	setTextareaCursor(&m.queryInput, 0, len(`update users {} {"$s`))
+
+	ok, _ := m.openCompletionForCursor(true)
+	if !ok {
+		t.Fatalf("expected mongo update operator completion to open")
+	}
+	found := false
+	for i, item := range m.columnPickerItems {
+		if item.label == "$set" {
+			m.columnPickerCursor = i
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected $set suggestion, got %#v", m.columnPickerItems)
+	}
+
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+	want := `update users {} {"$set":{}}`
+	if got.queryInput.Value() != want {
+		t.Fatalf("query input = %q, want %q", got.queryInput.Value(), want)
+	}
+}
+
+func TestMongoFilterCompletionUsesCollectionSchemaCacheAfterCollectionChange(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeConnIdx = 0
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "email", Type: "string"},
+		},
+	}
+	m.schemaCache[schemaCacheKey(0, "comments")] = &db.TableSchema{
+		Name: "comments",
+		Columns: []db.ColumnInfo{
+			{Name: "post_id", Type: "string"},
+			{Name: "author", Type: "string"},
+		},
+	}
+	m.queryInput.SetValue(`find comments {`)
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected mongo filter completion to open")
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["post_id"] || !found["author"] {
+		t.Fatalf("expected cached comments fields, got %v", found)
+	}
+}
+
+func TestMongoTypingCommandPrefixAutoOpensCompletion(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.queryInput.SetValue("")
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	got := next.(Model)
+	if !got.showColumnPicker {
+		t.Fatalf("expected command completion to open while typing")
+	}
+	labels := map[string]bool{}
+	for _, item := range got.columnPickerItems {
+		labels[item.label] = true
+	}
+	if !labels["find"] {
+		t.Fatalf("expected find command suggestion, got %v", labels)
+	}
+}
+
+func TestExtractTableFromQueryHandlesMongoReadCommands(t *testing.T) {
+	cases := []struct {
+		query string
+		want  string
+	}{
+		{query: `find users {"email":"a@x.com"} 20`, want: "users"},
+		{query: `count events {}`, want: "events"},
+		{query: `aggregate audit [{"$limit":5}]`, want: "audit"},
+		{query: `agg logs [{"$limit":5}]`, want: "logs"},
+	}
+	for _, tc := range cases {
+		if got := extractTableFromQuery(tc.query); got != tc.want {
+			t.Fatalf("extractTableFromQuery(%q) = %q, want %q", tc.query, got, tc.want)
+		}
+	}
+}
+
+func TestMongoFieldFilterPlaceholderUsesTypedLiteralForBool(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeConnIdx = 0
+	m.tableSchema = &db.TableSchema{
+		Name: "comments",
+		Columns: []db.ColumnInfo{
+			{Name: "isDemo", Type: "bool"},
+		},
+	}
+
+	items, _ := m.mongoArgumentItems("find", "comments", 2, "{", 1)
+	found := false
+	for _, item := range items {
+		if item.label == "isDemo" && strings.Contains(item.insertText, `"isDemo":null`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected bool field scaffold to use concrete unquoted literal, got %#v", items)
+	}
+}
+
+func TestMongoTypedJSONLiteralUsesBoolWithoutQuotes(t *testing.T) {
+	if got := mongoTypedJSONLiteral("bool", "true"); got != "true" {
+		t.Fatalf("bool true literal = %q, want true", got)
+	}
+	if got := mongoTypedJSONLiteral("bool", "false"); got != "false" {
+		t.Fatalf("bool false literal = %q, want false", got)
+	}
+	if got := mongoTypedJSONLiteral("string", "true"); got != `"true"` {
+		t.Fatalf("string true literal = %q, want quoted true", got)
+	}
+}
+
+func TestMongoTypedJSONLiteralHandlesObjectIDDateAndObject(t *testing.T) {
+	if got := mongoTypedJSONLiteral("objectId", "507f1f77bcf86cd799439011"); got != `{"$oid":"507f1f77bcf86cd799439011"}` {
+		t.Fatalf("objectId literal = %q", got)
+	}
+	if got := mongoTypedJSONLiteral("date", "2026-04-14T12:00:00Z"); !strings.Contains(got, `"$date"`) {
+		t.Fatalf("date literal should emit $date extjson, got %q", got)
+	}
+	if got := mongoTypedJSONLiteral("object", `{"a":1}`); got != `{"a":1}` {
+		t.Fatalf("object literal should preserve json object, got %q", got)
+	}
+}
+
+func TestMongoPlaceholderForComplexTypes(t *testing.T) {
+	if got := mongoPlaceholderForType("objectId"); got != `{"$oid":"000000000000000000000000"}` {
+		t.Fatalf("objectId placeholder = %q", got)
+	}
+	if got := mongoPlaceholderForType("date"); got != `{"$date":"2026-01-01T00:00:00Z"}` {
+		t.Fatalf("date placeholder = %q", got)
+	}
+	if got := mongoPlaceholderForType("map"); got != "{}" {
+		t.Fatalf("map placeholder = %q", got)
+	}
+}
+
+func TestMongoBoolValueCompletionOffersTrueFalseBeforeSamples(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeConnIdx = 0
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "comments",
+		Columns: []db.ColumnInfo{
+			{Name: "isDemo", Type: "bool"},
+		},
+	}
+	m.queryInput.SetValue(`find comments {"isDemo":tr`)
+	setTextareaCursor(&m.queryInput, 0, len(`find comments {"isDemo":tr`))
+
+	ok, _ := m.openCompletionForCursor(true)
+	if !ok {
+		t.Fatalf("expected mongo bool value completion to open")
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["true"] {
+		t.Fatalf("expected bool literal suggestions, got %v", found)
+	}
+}
+
+func TestMongoNestedOperatorCompletionSuggestsComparisonOperators(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "age", Type: "number"},
+		},
+	}
+	m.queryInput.SetValue(`find users {"age":{"$g`)
+	setTextareaCursor(&m.queryInput, 0, len(`find users {"age":{"$g`))
+
+	ok, _ := m.openCompletionForCursor(true)
+	if !ok {
+		t.Fatalf("expected mongo nested operator completion to open")
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["$gt"] || !found["$gte"] {
+		t.Fatalf("expected comparison operator suggestions, got %v", found)
+	}
+}
+
+func TestMongoOperatorCompletionPreservesExistingValueWhenSwitchingOperators(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "email", Type: "string"},
+		},
+	}
+	query := `find users {"email":{"$regex":"@gmail.com"}}`
+	m.queryInput.SetValue(query)
+	setTextareaCursor(&m.queryInput, 0, len(`find users {"email":{"$re`))
+
+	ok, _ := m.openCompletionForCursor(true)
+	if !ok {
+		t.Fatalf("expected mongo operator completion to open")
+	}
+	found := false
+	for i, item := range m.columnPickerItems {
+		if item.label == "$in" {
+			m.columnPickerCursor = i
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected $in suggestion, got %#v", m.columnPickerItems)
+	}
+
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+
+	want := `find users {"email":{"$in":["@gmail.com"]}}`
+	if got.queryInput.Value() != want {
+		t.Fatalf("query input = %q, want %q", got.queryInput.Value(), want)
+	}
+}
+
+func TestMongoValueCompletionReplacesOnlyValueLiteral(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeConnIdx = 0
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "email", Type: "string"},
+		},
+	}
+	key := columnValueKey(0, "users", "email")
+	m.columnValueCache[key] = []string{"alice@gmail.com", "bob@yahoo.com"}
+	query := `find users {"email":"@gm"}`
+	m.queryInput.SetValue(query)
+	setTextareaCursor(&m.queryInput, 0, len(`find users {"email":"@gm`))
+
+	ok, _ := m.openCompletionForCursor(true)
+	if !ok {
+		t.Fatalf("expected mongo value completion to open")
+	}
+	found := false
+	for i, item := range m.columnPickerItems {
+		if item.label == "alice@gmail.com" {
+			m.columnPickerCursor = i
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected cached mongo value suggestion, got %#v", m.columnPickerItems)
+	}
+
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+	want := `find users {"email":"alice@gmail.com"}`
+	if got.queryInput.Value() != want {
+		t.Fatalf("query input = %q, want %q", got.queryInput.Value(), want)
+	}
+}
+
+func TestExamplesPickerUsesBackendAwareExamples(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users"}
+	m.tableCursor = 0
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlE})
+	got := next.(Model)
+
+	if !got.showQueryPicker {
+		t.Fatalf("expected examples picker to open")
+	}
+	if got.queryPickerTitle != "Examples" {
+		t.Fatalf("picker title = %q, want Examples", got.queryPickerTitle)
+	}
+	labels := map[string]bool{}
+	for _, item := range got.queryPickerItems {
+		labels[item.label] = true
+	}
+	if !labels["Reference: use current collection"] || !labels["Read: find top documents"] || !labels["Filter: nested operator"] {
+		t.Fatalf("expected mongo examples, got %v", labels)
+	}
+}
+
+func TestMongoShellFormatFilterCompletionSuggestsFields(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "email", Type: "string"},
+			{Name: "status", Type: "string"},
+		},
+	}
+	// Shell format with cursor inside the filter object
+	m.queryInput.SetValue(`db.users.find({`)
+	setTextareaCursor(&m.queryInput, 0, len(`db.users.find({`))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected shell-format filter completion to open")
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["email"] || !found["status"] {
+		t.Fatalf("expected schema field suggestions in shell format, got %v", found)
+	}
+}
+
+func TestMongoShellFormatCollectionSwitchRebuildsQuery(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users", "comments", "events"}
+	m.queryInput.SetValue(`db.users.find({})`)
+	// Place cursor at start of collection (right after "db.")
+	setTextareaCursor(&m.queryInput, 0, 3) // at "db.|users..."
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected collection completion to open")
+	}
+	if m.columnPickerTitle != "Collections" {
+		t.Fatalf("expected Collections picker, got %q", m.columnPickerTitle)
+	}
+	// All collections should be available (no prefix filter at cursor start)
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["comments"] || !found["events"] || !found["users"] {
+		t.Fatalf("expected all collections in picker, got %v", found)
+	}
+	// Selecting "comments" should rebuild the full shell expression
+	for i, item := range m.columnPickerItems {
+		if item.label == "comments" {
+			m.columnPickerCursor = i
+			break
+		}
+	}
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+	if got.queryInput.Value() != "db.comments.find({})" {
+		t.Fatalf("expected collection switch to rebuild query, got %q", got.queryInput.Value())
+	}
+}
+
+func TestMongoPrefetchFiresLoadWhenCollectionChanges(t *testing.T) {
+	// When the user types `db.users` with `comments` as the active tableSchema
+	// and no cached `users` schema, prefetchInferredSchema should fire a load.
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeConnIdx = 0
+	m.tables = []string{"users", "orders", "comments"}
+	m.tableSchema = &db.TableSchema{
+		Name:    "comments",
+		Columns: []db.ColumnInfo{{Name: "body", Type: "string"}},
+	}
+
+	m.queryInput.SetValue("db.users.find({})")
+	cmd := m.prefetchInferredSchema()
+	if cmd == nil {
+		t.Fatalf("expected a schema prefetch command for `users`")
+	}
+	// Pending flag should be set so a second call returns nil.
+	if !m.schemaPending[schemaCacheKey(0, "users")] {
+		t.Fatalf("expected schemaPending[users] to be true after prefetch")
+	}
+	if cmd := m.prefetchInferredSchema(); cmd != nil {
+		t.Fatalf("expected second prefetch to be deduped while load is in flight")
+	}
+}
+
+func TestMongoPrefetchSkipsUnknownHalfTypedCollection(t *testing.T) {
+	// Typing `db.us` shouldn't fire a schema load for "us" — only exact table matches.
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeConnIdx = 0
+	m.tables = []string{"users", "comments"}
+	m.queryInput.SetValue("db.us")
+	if cmd := m.prefetchInferredSchema(); cmd != nil {
+		t.Fatalf("expected no prefetch for unknown partial name `us`")
+	}
+}
+
+func TestMongoShellCollectionSwapUsesDifferentSchema(t *testing.T) {
+	// Simulates the user's complaint: starting with db.comments.find({...}), then
+	// switching to db.users.find({...}) — the completion must use users' schema,
+	// not the previously-loaded comments schema.
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeConnIdx = 0
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users", "comments"}
+
+	// Left panel is still on "comments" (not manually switched)
+	m.tableSchema = &db.TableSchema{
+		Name: "comments",
+		Columns: []db.ColumnInfo{
+			{Name: "body", Type: "string"},
+			{Name: "author_id", Type: "objectId"},
+		},
+	}
+	// Users schema is pre-cached (simulating a prior load)
+	m.schemaCache[schemaCacheKey(0, "users")] = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "email", Type: "string"},
+			{Name: "isDemo", Type: "bool"},
+		},
+	}
+
+	// User edits query to target users, cursor inside the filter object
+	m.queryInput.SetValue(`db.users.find({`)
+	setTextareaCursor(&m.queryInput, 0, len(`db.users.find({`))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected completion picker to open")
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.label] = true
+	}
+	if !found["email"] || !found["isDemo"] {
+		t.Fatalf("expected users schema fields (email/isDemo), got %v", found)
+	}
+	if found["body"] || found["author_id"] {
+		t.Fatalf("should not show comments fields after collection swap, got %v", found)
+	}
+}
+
+func TestRankCompletionItemsMatchesContainsPrefixForDomains(t *testing.T) {
+	items := []columnPickerItem{
+		{label: "alice@gmail.com", insertText: "alice@gmail.com"},
+		{label: "bob@yahoo.com", insertText: "bob@yahoo.com"},
+	}
+	ranked := rankCompletionItems("@gmail", items)
+	if len(ranked) == 0 {
+		t.Fatalf("expected contains match for @gmail")
+	}
+	if ranked[0].label != "alice@gmail.com" {
+		t.Fatalf("top suggestion = %q, want gmail address", ranked[0].label)
+	}
+}
+
+func TestValueFilterPrefixSupportsLeftRightEditing(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.columnPickerValueMode = true
+	m.columnPickerValuePrefix = "@gmal"
+	m.columnPickerValueCursor = len([]rune(m.columnPickerValuePrefix))
+
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyLeft})
+	got := next.(Model)
+	next, _ = got.updateColumnPicker(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	got = next.(Model)
+
+	if got.columnPickerValuePrefix != "@gmail" {
+		t.Fatalf("filter prefix = %q, want @gmail", got.columnPickerValuePrefix)
+	}
+}
+
+func TestValueFilterSpaceEditsFilterNotQuery(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.queryInput.SetValue(`SELECT * FROM users WHERE email = 'a'`)
+	m.showColumnPicker = true
+	m.columnPickerItems = []columnPickerItem{{label: "alice@gmail.com", insertText: "alice@gmail.com"}}
+	m.columnPickerValueMode = true
+	m.columnPickerValuePrefix = "@gmail"
+	m.columnPickerValueCursor = len([]rune(m.columnPickerValuePrefix))
+
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeySpace})
+	got := next.(Model)
+
+	if got.columnPickerValuePrefix != "@gmail " {
+		t.Fatalf("value filter prefix = %q, want %q", got.columnPickerValuePrefix, "@gmail ")
+	}
+	if got.queryInput.Value() != `SELECT * FROM users WHERE email = 'a'` {
+		t.Fatalf("query should not change in value filter mode, got %q", got.queryInput.Value())
+	}
+}
+
+func TestLeftRightMovesQueryCursorWhilePickerOpen(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users"}
+	m.queryInput.SetValue(`SELECT * FROM users`)
+	setTextareaCursor(&m.queryInput, 0, len(`SELECT * FROM users`))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected completion picker to open")
+	}
+	before := m.queryCursorIndex()
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyLeft})
+	got := next.(Model)
+	after := got.queryCursorIndex()
+	if after >= before {
+		t.Fatalf("expected cursor to move left while picker open (before=%d after=%d)", before, after)
 	}
 }
 

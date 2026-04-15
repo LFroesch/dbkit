@@ -25,14 +25,14 @@ func (m Model) View() string {
 		return errorStyle.Render(fmt.Sprintf("terminal too small (%dx%d) — minimum %dx%d", m.width, m.height, minWidth, minHeight))
 	}
 
+	if m.showOllamaGen {
+		return m.renderDialogPage(m.renderOllamaGenModal())
+	}
 	if m.showHelp {
 		return m.renderDialogPage(m.renderHelpModal())
 	}
 	if m.showNewConn {
 		return m.renderDialogPage(m.renderNewConnModal())
-	}
-	if m.showColumnPicker {
-		return m.renderDialogPage(m.renderColumnPickerModal())
 	}
 	if m.showQueryPicker {
 		return m.renderDialogPage(m.renderQueryPickerModal())
@@ -77,7 +77,7 @@ func (m Model) renderHeader() string {
 			tabs = append(tabs, dimStyle.Render(" │ "))
 		}
 		name := tabNames[current]
-		disabled := m.activeDB == nil && (current == tabSchema || current == tabQuery || current == tabResults)
+		disabled := m.activeDB == nil && (current == tabBrowse || current == tabQuery || current == tabResults)
 		if current == m.activeTab {
 			tabs = append(tabs, activeTabStyle.Render(name))
 		} else if disabled {
@@ -128,42 +128,62 @@ func (m Model) renderFooter() string {
 		if m.focus == panelLeft {
 			add("enter", "connect")
 			add("n", "new")
+			add("e", "edit")
 			add("d", "delete...")
 			add("c", "copy dsn")
 		}
-	case tabSchema:
-		if m.focus == panelRight {
+	case tabBrowse:
+		if m.focus == panelRight && m.browseView == browseViewData {
+			add("↑/↓", "rows")
+			add("←/→", "columns")
+			add("enter", "schema")
+			add("e", "edit cell")
+			add("v", "inspect")
+			add("c", "copy row")
+		} else if m.focus == panelRight {
 			add("↑/↓", "fields")
-			add("enter", "view data")
-			add("e", "edit query")
+			add("enter", "data view")
+			add("e", "edit column")
 			add("v", "inspect")
 		} else {
 			add("↑/↓", m.dataSourceLabelPlural())
-			add("enter", "view data")
-			add("e", "edit query")
+			add("enter", "data view")
+			add("e", "edit")
 			add("r", "refresh")
 			add("c", "copy name")
 		}
 	case tabQuery:
 		if m.queryFocus {
-			add("ctrl+r", "run")
-			add("ctrl+t", "templates")
-			add("ctrl+o", "recent")
-			add("ctrl+g", "saved")
-			add("ctrl+l", "clear")
-			add("ctrl+s", "save")
-			if len(m.snippetPlaceholders) > 0 {
-				add("tab", "next field")
+			if m.showColumnPicker {
+				add("↑/↓", "move")
+				add("tab", "insert")
+				add("enter", "newline")
+				if m.columnPickerMulti {
+					add("space", "toggle")
+				}
+				add("esc", "close")
 			} else {
+				add("ctrl+r", "run")
 				add("tab", "complete")
+				add("ctrl+g", "ai generate")
+				add("ctrl+t", "templates")
+				add("ctrl+e", "examples")
+				add("ctrl+o", "recent")
+				add("ctrl+u", "saved")
+				add("ctrl+p/n", "history")
+				add("ctrl+l", "clear")
+				add("ctrl+s", "save")
+				add("esc", "blur")
 			}
-			add("esc", "blur")
 		} else {
 			add("↑/↓", m.dataSourceLabelPlural())
 			add("e", "editor")
 			add("enter", "view data")
+			add("g", "ai generate")
 			add("f", "templates")
+			add("x", "examples")
 			add("y", "recent")
+			add("u", "saved")
 			add("ctrl+l", "clear")
 		}
 	case tabResults:
@@ -171,12 +191,12 @@ func (m Model) renderFooter() string {
 			add("↑/↓", "result rows")
 			add("←/→", "columns")
 			add("c", "copy row")
-			add("e", "query")
+			add("e", "edit cell")
 			add("v", "inspect")
 			add("C", "copy as")
 		} else {
 			add("↑/↓", m.dataSourceLabelPlural())
-			add("e", "query")
+			add("e", "edit")
 			add("enter", "view data")
 		}
 	case tabHistory:
@@ -191,7 +211,7 @@ func (m Model) renderFooter() string {
 	}
 
 	add("?", "help")
-	add("q", "quit")
+	add("q", "back")
 
 	line := " "
 	for i, item := range hints {
@@ -212,9 +232,6 @@ func (m Model) headerStatusText() string {
 	parts := []string{fmt.Sprintf("%d conns", len(m.cfg.Connections))}
 	if m.activeDB != nil {
 		parts = append(parts, "● "+m.activeConnName, fmt.Sprintf("%d %s", len(m.tables), m.dataSourceLabelPlural()))
-	}
-	if m.loading {
-		parts = append(parts, "loading...")
 	}
 	return strings.Join(parts, " · ")
 }
@@ -284,8 +301,10 @@ func (m Model) renderLeftPanel(w, h int) string {
 	switch m.activeTab {
 	case tabConnections:
 		return m.renderConnectionList(w, h)
-	case tabSchema, tabQuery, tabResults:
+	case tabBrowse, tabQuery:
 		return m.renderTableList(w, h)
+	case tabResults:
+		return m.renderLastRunQuery(w, h)
 	case tabHistory:
 		return m.renderHistoryList(w, h)
 	case tabHelpers:
@@ -347,6 +366,19 @@ func (m Model) renderTableList(w, h int) string {
 	return padLines(lines, h)
 }
 
+func (m Model) renderLastRunQuery(w, h int) string {
+	lines := []string{panelHeaderStyle.Render("Last Query"), ""}
+	q := strings.TrimSpace(m.lastRunQuery)
+	if q == "" {
+		lines = append(lines, dimStyle.Render("no query run yet"))
+		return padLines(lines, h)
+	}
+	for _, line := range wrapTextPreservingRuns(q, max(12, w-1)) {
+		lines = append(lines, accentStyle.Render(line))
+	}
+	return padLines(lines, h)
+}
+
 func (m Model) renderHelperList(w, h int) string {
 	lines := []string{panelHeaderStyle.Render("Templates"), ""}
 	helpers := m.helperItems()
@@ -395,8 +427,8 @@ func (m Model) renderRightPanel(w, h int) string {
 	switch m.activeTab {
 	case tabConnections:
 		return m.renderConnectionDetail(w, h)
-	case tabSchema:
-		return m.renderSchemaDetail(w, h)
+	case tabBrowse:
+		return m.renderBrowseDetail(w, h)
 	case tabQuery:
 		return m.renderQueryPanel(w, h)
 	case tabResults:
@@ -431,35 +463,87 @@ func (m Model) renderConnectionDetail(w, h int) string {
 	if m.activeConnIdx == m.connCursor {
 		lines = append(lines, connectedStyle.Render("● connected"))
 	} else {
-		lines = append(lines, dimStyle.Render("enter: connect   d: delete..."))
+		lines = append(lines, dimStyle.Render("enter: connect   e: edit   d: delete..."))
 	}
 
 	return padLines(lines, h)
 }
 
-func (m Model) renderSchemaDetail(w, h int) string {
+func (m Model) renderBrowseDetail(w, h int) string {
 	if m.activeDB == nil {
 		return padLines([]string{dimStyle.Render("not connected")}, h)
 	}
+	if m.browseView == browseViewData {
+		return m.renderBrowseDataPanel(w, h)
+	}
+	return m.renderBrowseSchemaPanel(w, h)
+}
+
+func (m Model) renderBrowseSchemaPanel(w, h int) string {
 	if m.tableSchema == nil {
-		if m.loading {
-			return padLines([]string{warnStyle.Render("loading schema...")}, h)
-		}
 		return padLines([]string{dimStyle.Render("select a " + m.dataSourceLabel())}, h)
 	}
 
 	s := m.tableSchema
 	lines := []string{
-		renderPaneTitle(s.Name, fmt.Sprintf("%d fields · %d rows", len(s.Columns), s.RowCount), w),
+		renderPaneTitle(s.Name, fmt.Sprintf("schema · %d fields · %d rows", len(s.Columns), s.RowCount), w),
 		dimStyle.Render(strings.Repeat("─", max(1, w))),
 	}
 	tbl := m.schemaTable
 	tbl.SetWidth(max(10, w))
-	// bubbles/table height does not account for its own header chrome, so leave room
-	// for that to keep the pane border aligned with the left side.
 	tbl.SetHeight(max(1, h-len(lines)-2))
 	lines = append(lines, strings.Split(strings.TrimRight(tbl.View(), "\n"), "\n")...)
 	return padLines(lines, h)
+}
+
+func (m Model) renderBrowseDataPanel(w, h int) string {
+	tableName := m.currentTableName()
+	if tableName == "" {
+		return padLines([]string{dimStyle.Render("select a " + m.dataSourceLabel())}, h)
+	}
+
+	meta := m.browseDataMeta()
+	lines := []string{
+		renderPaneTitle(tableName, "data", w),
+		dimStyle.Render(strings.Repeat("─", max(1, w))),
+	}
+
+	tbl := m.browseDataTable
+	tbl.SetWidth(max(10, w))
+	tableH := max(1, h-len(lines)-1)
+	if meta != "" {
+		tableH = max(1, h-len(lines)-3)
+	}
+	tbl.SetHeight(tableH)
+	lines = append(lines, strings.Split(strings.TrimRight(tbl.View(), "\n"), "\n")...)
+	if meta != "" {
+		lines = append(lines, "", meta)
+	}
+	return padLines(lines, h)
+}
+
+func (m Model) browseDataMeta() string {
+	if m.browseData == nil {
+		return ""
+	}
+	totalCols := len(m.browseData.Columns)
+	if totalCols == 0 {
+		return ""
+	}
+	start := m.browseColOffset + 1
+	end := m.browseColOffset + m.browseVisibleColumn
+	if end < start {
+		end = start
+	}
+	parts := []string{
+		dimStyle.Render(fmt.Sprintf("%d row(s)", len(m.browseData.Rows))),
+		dimStyle.Render(fmt.Sprintf("cols %d-%d/%d", start, end, totalCols)),
+	}
+	if totalCols > m.browseVisibleColumn {
+		parts = append(parts, accentStyle.Render("←/→ columns"))
+	}
+	parts = append(parts, dimStyle.Render("enter: schema"))
+	return strings.Join(parts, dimStyle.Render(" · "))
 }
 
 func (m Model) renderQueryPanel(w, h int) string {
@@ -480,6 +564,9 @@ func (m Model) renderQueryPanel(w, h int) string {
 	var lines []string
 	lines = append(lines, label)
 	lines = append(lines, strings.Split(m.queryInput.View(), "\n")...)
+	if m.showColumnPicker {
+		lines = append(lines, m.renderCompletionPopover(w)...)
+	}
 	lines = append(lines, divider)
 	switch {
 	case m.loading:
@@ -498,11 +585,6 @@ func (m Model) renderQueryPanel(w, h int) string {
 	if meta != "" {
 		lines = append(lines, "", meta)
 	}
-	if guide := m.renderQueryGuide(w, max(0, h-len(lines))); len(guide) > 0 {
-		lines = append(lines, "")
-		lines = append(lines, guide...)
-	}
-
 	return padLines(lines, h)
 }
 
@@ -576,7 +658,7 @@ func (m Model) renderHelperPreview(w, h int) string {
 		meta = m.activeDB.Type() + " template"
 	}
 	if helper.kind == "prompt" {
-		meta = "copyable prompt"
+		meta = ""
 	}
 	lines := []string{renderPaneTitle(helper.label, meta, w), ""}
 	for _, line := range strings.Split(helper.template, "\n") {
@@ -614,7 +696,13 @@ func (m Model) renderConfirmModal() string {
 
 func (m Model) renderNewConnModal() string {
 	var lines []string
-	lines = append(lines, panelHeaderStyle.Render("New Connection"), "")
+	title := "New Connection"
+	saveText := "save"
+	if m.newConnEditIdx >= 0 {
+		title = "Edit Connection"
+		saveText = "save changes"
+	}
+	lines = append(lines, panelHeaderStyle.Render(title), "")
 
 	namePrefix := "  "
 	if m.newConnFocus == newConnFocusName {
@@ -643,12 +731,12 @@ func (m Model) renderNewConnModal() string {
 	lines = append(lines, dsnPrefix+accentStyle.Render("dsn  ")+m.newConnInputs[fieldDSN].View())
 	lines = append(lines, "")
 
-	saveLabel := inactiveTabStyle.Render("save")
+	saveLabel := inactiveTabStyle.Render(saveText)
 	if m.newConnFocus == newConnFocusSave {
-		saveLabel = activeTabStyle.Render("save")
+		saveLabel = activeTabStyle.Render(saveText)
 	}
 	lines = append(lines, "  [ "+saveLabel+" ]")
-	lines = append(lines, "", dimStyle.Render("tab/shift+tab navigate · left/right type · esc cancel"))
+	lines = append(lines, "", dimStyle.Render("tab inserts · left/right type · paste normally · esc cancel"))
 
 	return dialogStyle.Width(min(92, m.width-6)).Render(strings.Join(lines, "\n"))
 }
@@ -662,27 +750,32 @@ func (m Model) renderHelpModal() string {
 		keyStyle.Render("↑/↓") + " " + actionStyle.Render("move selection"),
 		keyStyle.Render("enter") + " " + actionStyle.Render("connect / select / use"),
 		keyStyle.Render("n") + " " + actionStyle.Render("new connection"),
+		keyStyle.Render("e") + " " + actionStyle.Render("edit selected connection"),
 		keyStyle.Render("d") + " " + actionStyle.Render("delete connection (confirm)"),
-		keyStyle.Render("r") + " " + actionStyle.Render("refresh schema list"),
-		keyStyle.Render("enter") + " " + actionStyle.Render("view selected data"),
-		keyStyle.Render("e") + " " + actionStyle.Render("focus query editor"),
+		keyStyle.Render("r") + " " + actionStyle.Render("refresh browse list"),
+		keyStyle.Render("enter") + " " + actionStyle.Render("toggle schema / data view"),
+		keyStyle.Render("e") + " " + actionStyle.Render("edit focused cell — pre-fills current value"),
+		keyStyle.Render("E") + " " + actionStyle.Render("edit focused cell — empty value (for replacing)"),
 		keyStyle.Render("ctrl+r") + " " + actionStyle.Render("run query"),
 		keyStyle.Render("y / enter") + " " + actionStyle.Render("confirm destructive actions"),
 		keyStyle.Render("n / esc") + " " + actionStyle.Render("cancel destructive actions"),
 		keyStyle.Render("ctrl+l") + " " + actionStyle.Render("clear query editor"),
+		keyStyle.Render("ctrl+g") + " " + actionStyle.Render("AI generate query (ollama)"),
+		keyStyle.Render("ctrl+t") + " " + actionStyle.Render("templates picker"),
+		keyStyle.Render("ctrl+e") + " " + actionStyle.Render("examples picker"),
 		keyStyle.Render("ctrl+o") + " " + actionStyle.Render("query history picker"),
-		keyStyle.Render("ctrl+g") + " " + actionStyle.Render("saved query picker"),
+		keyStyle.Render("ctrl+u") + " " + actionStyle.Render("saved query picker"),
+		keyStyle.Render("ctrl+p / ctrl+n") + " " + actionStyle.Render("cycle history inline"),
 		keyStyle.Render("ctrl+s") + " " + actionStyle.Render("save current query"),
 		keyStyle.Render("ctrl+y") + " " + actionStyle.Render("last run"),
-		keyStyle.Render("tab") + " " + actionStyle.Render("completion / next snippet field"),
-		keyStyle.Render("shift+tab") + " " + actionStyle.Render("previous snippet field"),
-		keyStyle.Render("f / y") + " " + actionStyle.Render("templates / history from Query"),
-		keyStyle.Render("g / s") + " " + actionStyle.Render("saved queries / save from Query"),
+		keyStyle.Render("tab") + " " + actionStyle.Render("accept completion"),
+		keyStyle.Render("f / x / y") + " " + actionStyle.Render("templates / examples / history from Query"),
+		keyStyle.Render("g / u / s") + " " + actionStyle.Render("ai generate / saved / save from Query"),
 		keyStyle.Render("←/→") + " " + actionStyle.Render("page result columns"),
 		keyStyle.Render("c / C") + " " + actionStyle.Render("copy direct / copy as"),
 		keyStyle.Render("v") + " " + actionStyle.Render("inspect selected schema/result row"),
 		keyStyle.Render("esc") + " " + actionStyle.Render("close modal / blur editor"),
-		keyStyle.Render("q") + " " + actionStyle.Render("quit"),
+		keyStyle.Render("q") + " " + actionStyle.Render("back (quit from connections)"),
 		"",
 		dimStyle.Render("press any key to close"),
 	}
@@ -729,7 +822,7 @@ func (m Model) queryContextLabel() string {
 	if m.activeDB != nil {
 		parts = append(parts, m.activeDB.Type())
 	}
-	if table := m.currentTableName(); table != "" {
+	if table := m.queryInferredTable(); table != "" {
 		parts = append(parts, table)
 	}
 	return strings.Join(parts, " · ")
@@ -854,7 +947,15 @@ func (m Model) renderQueryPickerModal() string {
 	end := min(len(m.queryPickerItems), start+visibleH)
 	for i := start; i < end; i++ {
 		item := m.queryPickerItems[i]
-		row := truncate(item.label, max(12, rowW-20))
+		if item.sectionRow {
+			lines = append(lines, "", accentStyle.Render(" "+strings.ToUpper(item.label)))
+			continue
+		}
+		labelW := rowW
+		if item.detail != "" {
+			labelW = max(12, rowW-20)
+		}
+		row := truncate(item.label, labelW)
 		if item.detail != "" {
 			row += "  " + truncate(item.detail, 18)
 		}
@@ -864,19 +965,33 @@ func (m Model) renderQueryPickerModal() string {
 			lines = append(lines, " "+row)
 		}
 	}
-	lines = append(lines, "", dimStyle.Render("enter inserts · c copies · esc closes"))
+	// Preview selected item value
+	if item := m.currentQueryPickerItem(); item.value != "" {
+		previewLines := strings.SplitN(strings.TrimSpace(item.value), "\n", 5)
+		lines = append(lines, "")
+		for i, pl := range previewLines {
+			if i == 4 {
+				lines = append(lines, dimStyle.Render("  …"))
+				break
+			}
+			lines = append(lines, dimStyle.Render("  "+truncate(pl, max(20, rowW-2))))
+		}
+	}
+	lines = append(lines, "", dimStyle.Render("enter loads · c copies · esc closes"))
 	return dialogStyle.Width(min(92, m.width-6)).Render(strings.Join(lines, "\n"))
 }
 
-func (m Model) renderColumnPickerModal() string {
-	lines := []string{panelHeaderStyle.Render(m.columnPickerTitle), ""}
-	rowW := max(28, min(72, m.width-14))
+func (m Model) renderCompletionPopover(w int) []string {
+	popW := max(28, min(60, w-2))
+	rowW := popW - 2
+	title := panelHeaderStyle.Render(m.columnPickerTitle)
+	lines := []string{title}
 	if len(m.columnPickerItems) == 0 {
-		lines = append(lines, dimStyle.Render("no completion items available"))
-		lines = append(lines, "", dimStyle.Render("esc closes"))
-		return dialogStyle.Width(min(92, m.width-6)).Render(strings.Join(lines, "\n"))
+		lines = append(lines, dimStyle.Render("  no completion items available"))
+		lines = append(lines, dimStyle.Render("  esc closes"))
+		return lines
 	}
-	visibleH := max(5, min(14, m.height-12))
+	visibleH := max(4, min(8, m.height/3))
 	start := listStartForCursor(len(m.columnPickerItems), visibleH, m.columnPickerCursor)
 	end := min(len(m.columnPickerItems), start+visibleH)
 	for i := start; i < end; i++ {
@@ -891,9 +1006,10 @@ func (m Model) renderColumnPickerModal() string {
 				marker = " ▸ "
 			}
 		}
-		row := marker + " " + truncate(item.label, max(12, rowW-20))
+		label := truncate(item.label, max(10, rowW-20))
+		row := marker + " " + label
 		if item.detail != "" {
-			row += "  " + truncate(item.detail, 18)
+			row += "  " + dimStyle.Render(truncate(item.detail, 18))
 		}
 		if i == m.columnPickerCursor {
 			lines = append(lines, selectedItemStyle.Render(" "+padRight(row, rowW)+" "))
@@ -901,32 +1017,27 @@ func (m Model) renderColumnPickerModal() string {
 			lines = append(lines, " "+row)
 		}
 	}
-	hint := "enter inserts · esc closes"
-	if m.columnPickerMulti {
-		hint = "space toggles · enter inserts · esc closes"
+	if end < len(m.columnPickerItems) {
+		lines = append(lines, dimStyle.Render(fmt.Sprintf("  +%d more…", len(m.columnPickerItems)-end)))
 	}
-	lines = append(lines, "", dimStyle.Render(hint))
-	return dialogStyle.Width(min(92, m.width-6)).Render(strings.Join(lines, "\n"))
-}
-
-func (m Model) renderQueryGuide(w, available int) []string {
-	if available < 3 {
-		return nil
+	if m.columnPickerValueMode {
+		filter := m.columnPickerValuePrefix
+		if filter != "" {
+			runes := []rune(filter)
+			cursor := clampInt(m.columnPickerValueCursor, 0, len(runes))
+			filter = string(runes[:cursor]) + "|" + string(runes[cursor:])
+		} else {
+			filter = "|"
+		}
+		lines = append(lines, accentStyle.Render("  filter: "+filter))
 	}
-	lines := []string{panelHeaderStyle.Render("Quick Start")}
-	if m.activeDB != nil && m.activeDB.Type() == "mongo" {
-		lines = append(lines,
-			dimStyle.Render("tab opens completions. ctrl+t opens templates. run help for command syntax."),
-			accentStyle.Render(truncate(fmt.Sprintf("find %s {} 50", fallbackTableName(m.currentTableName())), w)),
-		)
-		return lines
+	hint := "↑/↓ move · tab insert · enter newline · esc close"
+	if m.columnPickerValueMode {
+		hint = "↑/↓ move · type to filter · ←/→ edit · tab insert · enter newline · esc close"
+	} else if m.columnPickerMulti {
+		hint = "↑/↓ · space toggle · tab insert · enter newline · esc close"
 	}
-	table := fallbackTableName(m.currentTableName())
-	filterCol := fallbackColumnName(m.preferredFilterColumn())
-	lines = append(lines,
-		dimStyle.Render("tab opens completions. ctrl+t opens templates. ctrl+o shows recent queries."),
-		accentStyle.Render(truncate(fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" = 'value' LIMIT 50;`, table, filterCol), w)),
-	)
+	lines = append(lines, dimStyle.Render("  "+hint))
 	return lines
 }
 
@@ -1015,6 +1126,29 @@ func fitTableCell(s string, width int) string {
 
 func (m Model) inspectViewportHeight() int {
 	return max(6, min(20, m.height-10))
+}
+
+// colorizeJSONLine applies minimal syntax coloring to a single indented JSON line.
+func colorizeJSONLine(line string) string {
+	trimmed := strings.TrimLeft(line, " ")
+	if trimmed == "" {
+		return line
+	}
+	indent := line[:len(line)-len(trimmed)]
+	// Structural-only lines: {, }, [, ], with optional trailing comma
+	clean := strings.TrimRight(trimmed, ",")
+	if clean == "{" || clean == "}" || clean == "[" || clean == "]" {
+		return indent + dimStyle.Render(trimmed)
+	}
+	// "key": value — color key in accent, value in text
+	if strings.HasPrefix(trimmed, `"`) {
+		if i := strings.Index(trimmed, `":`); i > 0 {
+			key := trimmed[:i+2]
+			rest := trimmed[i+2:]
+			return indent + accentStyle.Render(key) + textStyle.Render(rest)
+		}
+	}
+	return textStyle.Render(line)
 }
 
 func truncate(s string, maxLen int) string {
@@ -1214,4 +1348,32 @@ func clampInt(v, low, high int) int {
 		return high
 	}
 	return v
+}
+
+func (m Model) renderOllamaGenModal() string {
+	lines := []string{panelHeaderStyle.Render("Generate Query with Ollama"), ""}
+	rowW := max(32, min(72, m.width-14))
+
+	switch {
+	case m.ollamaGenerating:
+		lines = append(lines, accentStyle.Render("  generating..."))
+		lines = append(lines, "", dimStyle.Render("esc cancels"))
+
+	case m.ollamaErr != "":
+		lines = append(lines, errorStyle.Render("error: "+m.ollamaErr))
+		lines = append(lines, "", dimStyle.Render("r to retry · esc closes"))
+
+	case m.ollamaResult != "":
+		resultLines := strings.Split(strings.TrimSpace(m.ollamaResult), "\n")
+		for _, rl := range resultLines {
+			lines = append(lines, dimStyle.Render("  "+truncate(rl, max(20, rowW-2))))
+		}
+		lines = append(lines, "", dimStyle.Render("enter accepts · r retry · esc cancel"))
+
+	default:
+		lines = append(lines, m.ollamaInput.View())
+		lines = append(lines, "", dimStyle.Render("enter to generate · esc closes"))
+	}
+
+	return dialogStyle.Width(min(92, m.width-6)).Render(strings.Join(lines, "\n"))
 }

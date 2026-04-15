@@ -185,14 +185,9 @@ func (d *MongoDB) RunQuery(query string) (*QueryResult, error) {
 		return nil, fmt.Errorf("not connected")
 	}
 
-	cmd, rest := nextWord(query)
-	cmd = strings.ToLower(cmd)
-	switch cmd {
-	case "":
-		return nil, fmt.Errorf("empty query")
-	case "help":
-		return &QueryResult{Message: mongoHelp()}, nil
-	case "collections", "show":
+	q := strings.TrimSpace(query)
+
+	if strings.EqualFold(q, "collections") || strings.EqualFold(q, "show collections") {
 		names, err := d.GetTables()
 		if err != nil {
 			return nil, err
@@ -202,9 +197,18 @@ func (d *MongoDB) RunQuery(query string) (*QueryResult, error) {
 			rows = append(rows, []string{n})
 		}
 		return &QueryResult{Columns: []string{"collection"}, Rows: rows}, nil
+	}
+
+	internal, ok := parseShellQuery(q)
+	if !ok {
+		return nil, fmt.Errorf("invalid query — use: db.collection.method({...}) or \"collections\"")
+	}
+
+	cmd, rest := nextWord(internal)
+	switch strings.ToLower(cmd) {
 	case "find":
 		return d.runFind(rest)
-	case "aggregate", "agg":
+	case "aggregate":
 		return d.runAggregate(rest)
 	case "count":
 		return d.runCount(rest)
@@ -212,10 +216,10 @@ func (d *MongoDB) RunQuery(query string) (*QueryResult, error) {
 		return d.runInsert(rest)
 	case "update":
 		return d.runUpdate(rest)
-	case "delete", "remove":
+	case "delete":
 		return d.runDelete(rest)
 	default:
-		return nil, fmt.Errorf("unknown mongo command %q. run 'help'", cmd)
+		return nil, fmt.Errorf("unsupported method %q", cmd)
 	}
 }
 
@@ -383,7 +387,7 @@ func (d *MongoDB) runInsert(rest string) (*QueryResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &QueryResult{Message: fmt.Sprintf("inserted _id=%s", formatMongoValue(res.InsertedID))}, nil
+	return &QueryResult{Message: fmt.Sprintf("inserted _id=%s", formatMongoValue(res.InsertedID)), Affected: 1}, nil
 }
 
 func (d *MongoDB) runUpdate(rest string) (*QueryResult, error) {
@@ -419,13 +423,13 @@ func (d *MongoDB) runUpdate(rest string) (*QueryResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &QueryResult{Message: fmt.Sprintf("matched=%d modified=%d", res.MatchedCount, res.ModifiedCount)}, nil
+		return &QueryResult{Message: fmt.Sprintf("matched=%d modified=%d", res.MatchedCount, res.ModifiedCount), Affected: res.ModifiedCount}, nil
 	}
 	res, err := d.db.Collection(collection).UpdateOne(ctx, filter, update)
 	if err != nil {
 		return nil, err
 	}
-	return &QueryResult{Message: fmt.Sprintf("matched=%d modified=%d", res.MatchedCount, res.ModifiedCount)}, nil
+	return &QueryResult{Message: fmt.Sprintf("matched=%d modified=%d", res.MatchedCount, res.ModifiedCount), Affected: res.ModifiedCount}, nil
 }
 
 func (d *MongoDB) runDelete(rest string) (*QueryResult, error) {
@@ -453,13 +457,13 @@ func (d *MongoDB) runDelete(rest string) (*QueryResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &QueryResult{Message: fmt.Sprintf("deleted=%d", res.DeletedCount)}, nil
+		return &QueryResult{Message: fmt.Sprintf("deleted=%d", res.DeletedCount), Affected: res.DeletedCount}, nil
 	}
 	res, err := d.db.Collection(collection).DeleteOne(ctx, filter)
 	if err != nil {
 		return nil, err
 	}
-	return &QueryResult{Message: fmt.Sprintf("deleted=%d", res.DeletedCount)}, nil
+	return &QueryResult{Message: fmt.Sprintf("deleted=%d", res.DeletedCount), Affected: res.DeletedCount}, nil
 }
 
 func parseMongoDBName(uri string) (string, error) {
@@ -678,20 +682,155 @@ func remove(items []string, target string) []string {
 	return result
 }
 
-func mongoHelp() string {
-	return strings.Join([]string{
-		"Mongo commands:",
-		"find <collection> [filter-json] [limit] [sort-json]",
-		"aggregate <collection> <pipeline-json-array>",
-		"count <collection> [filter-json]",
-		"insert <collection> <document-json>",
-		"update <collection> <filter-json> <update-json> [many]",
-		"delete <collection> <filter-json> [many]",
-		"collections",
-		"",
-		`examples:`,
-		`  find users {} 50`,
-		`  find users {"status":"active"} 20 {"created_at":-1}`,
-		`  aggregate orders [{"$match":{"paid":true}},{"$group":{"_id":"$sku","n":{"$sum":1}}}]`,
-	}, "\n")
+// parseShellQuery converts db.collection.method(args) to the internal query format.
+// Returns the internal query string and true on success.
+func parseShellQuery(query string) (string, bool) {
+	q := strings.TrimSpace(query)
+	if !strings.HasPrefix(q, "db.") {
+		return "", false
+	}
+	rest := q[3:]
+
+	dotIdx := strings.Index(rest, ".")
+	if dotIdx < 0 {
+		return "", false
+	}
+	collection := rest[:dotIdx]
+	rest = rest[dotIdx+1:]
+
+	parenIdx := strings.Index(rest, "(")
+	if parenIdx < 0 {
+		return "", false
+	}
+	method := strings.ToLower(rest[:parenIdx])
+	rest = rest[parenIdx+1:]
+
+	argsStr, ok := extractShellArgs(rest)
+	if !ok {
+		return "", false
+	}
+
+	args := splitShellArgs(argsStr)
+
+	arg0 := ""
+	if len(args) > 0 {
+		arg0 = strings.TrimSpace(args[0])
+	}
+	arg1 := ""
+	if len(args) > 1 {
+		arg1 = strings.TrimSpace(args[1])
+	}
+	if arg0 == "" {
+		arg0 = "{}"
+	}
+
+	switch method {
+	case "find":
+		return "find " + collection + " " + arg0, true
+	case "findone":
+		return "find " + collection + " " + arg0 + " 1", true
+	case "aggregate":
+		if arg0 == "{}" {
+			arg0 = "[]"
+		}
+		return "aggregate " + collection + " " + arg0, true
+	case "updateone":
+		if arg1 == "" {
+			return "", false
+		}
+		return "update " + collection + " " + arg0 + " " + arg1, true
+	case "updatemany":
+		if arg1 == "" {
+			return "", false
+		}
+		return "update " + collection + " " + arg0 + " " + arg1 + " many", true
+	case "insertone":
+		return "insert " + collection + " " + arg0, true
+	case "insertmany":
+		// treat as multiple inserts — just run the first doc or return unsupported
+		return "insert " + collection + " " + arg0, true
+	case "deleteone":
+		return "delete " + collection + " " + arg0, true
+	case "deletemany":
+		return "delete " + collection + " " + arg0 + " many", true
+	case "countdocuments", "count":
+		return "count " + collection + " " + arg0, true
+	}
+	return "", false
+}
+
+// extractShellArgs extracts the content inside the outermost () of a method call.
+// Input starts immediately after the opening '('.
+func extractShellArgs(s string) (string, bool) {
+	depth := 1
+	inStr := false
+	escape := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if ch == '\\' && inStr {
+			escape = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		switch ch {
+		case '(', '{', '[':
+			depth++
+		case ')', '}', ']':
+			depth--
+			if depth == 0 {
+				return s[:i], true
+			}
+		}
+	}
+	return strings.TrimRight(s, ")"), true // lenient: unclosed paren
+}
+
+// splitShellArgs splits top-level comma-separated args (not inside {}, [], ()).
+func splitShellArgs(s string) []string {
+	var args []string
+	depth := 0
+	inStr := false
+	escape := false
+	start := 0
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if ch == '\\' && inStr {
+			escape = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		switch ch {
+		case '{', '[', '(':
+			depth++
+		case '}', ']', ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				args = append(args, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	args = append(args, s[start:])
+	return args
 }

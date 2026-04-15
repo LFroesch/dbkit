@@ -16,7 +16,7 @@ type tab int
 
 const (
 	tabConnections tab = iota
-	tabSchema
+	tabBrowse
 	tabQuery
 	tabResults
 	tabHistory
@@ -24,8 +24,8 @@ const (
 	tabCount
 )
 
-var tabNames = [tabCount]string{"Connections", "Schema", "Query", "Results", "History", "Helpers"}
-var primaryTabs = []tab{tabConnections, tabSchema, tabQuery, tabResults}
+var tabNames = [tabCount]string{"Connections", "Browse", "Query", "Results", "History", "Helpers"}
+var primaryTabs = []tab{tabConnections, tabBrowse, tabQuery, tabResults}
 
 type queryHelper struct {
 	label    string
@@ -34,10 +34,11 @@ type queryHelper struct {
 }
 
 type queryPickerItem struct {
-	label  string
-	detail string
-	value  string
-	kind   string
+	label      string
+	detail     string
+	value      string
+	kind       string
+	sectionRow bool
 }
 
 type columnPickerItem struct {
@@ -45,13 +46,6 @@ type columnPickerItem struct {
 	detail     string
 	insertText string
 	selected   bool
-}
-
-type snippetPlaceholder struct {
-	name  string
-	start int
-	end   int
-	fresh bool
 }
 
 type confirmAction int
@@ -67,6 +61,13 @@ type panel int
 const (
 	panelLeft panel = iota
 	panelRight
+)
+
+type browseView int
+
+const (
+	browseViewSchema browseView = iota
+	browseViewData
 )
 
 // Async messages
@@ -89,10 +90,29 @@ type schemaLoadedMsg struct {
 	err    error
 }
 type queryDoneMsg struct {
+	reqID       int
+	query       string
+	result      *db.QueryResult
+	err         error
+	autoRefresh bool
+}
+type columnValuesMsg struct {
+	reqID   int
+	connIdx int
+	table   string
+	column  string
+	values  []string
+	err     error
+}
+type browseDataLoadedMsg struct {
 	reqID  int
-	query  string
+	table  string
 	result *db.QueryResult
 	err    error
+}
+type ollamaQueryDoneMsg struct {
+	query string
+	err   error
 }
 
 // New connection form field indices
@@ -132,12 +152,20 @@ type Model struct {
 	newConnInputs  [fieldCount]textinput.Model
 	newConnTypeCur int // index into dbTypes
 	newConnFocus   int // one of newConnFocus*
+	newConnEditIdx int
 
-	// Schema tab
-	tables      []string
-	tableCursor int
-	tableSchema *db.TableSchema
-	schemaTable table.Model
+	// Browse tab
+	tables              []string
+	tableCursor         int
+	tableSchema         *db.TableSchema
+	schemaTable         table.Model
+	browseView          browseView
+	browseData          *db.QueryResult
+	browseDataTable     table.Model
+	browseDataTableName string
+	browseDataReqID     int
+	browseColOffset     int
+	browseVisibleColumn int
 
 	// Query tab
 	queryInput          textarea.Model
@@ -151,6 +179,7 @@ type Model struct {
 	savedQueries        []config.SavedQuery
 	queryHistoryIdx     int
 	lastRunQuery        string
+	querySourceTable    string
 
 	// History tab
 	historyCursor int
@@ -169,6 +198,17 @@ type Model struct {
 	tablesReqID  int
 	schemaReqID  int
 	queryReqID   int
+	valuesReqID  int
+
+	// Column sample value cache for value completions.
+	// Keyed by "connIdx|table|column".
+	columnValueCache   map[string][]string
+	columnValuePending map[string]bool
+	// Schema cache keyed by "connIdx|table" so query completions can resolve
+	// fields for non-focused tables/collections.
+	schemaCache map[string]*db.TableSchema
+	// Tracks in-flight cache-only schema loads to avoid duplicate requests.
+	schemaPending map[string]bool
 
 	// Modal overlay: new connection form visible
 	showNewConn bool
@@ -188,8 +228,12 @@ type Model struct {
 	columnPickerStart    int
 	columnPickerEnd      int
 	columnPickerFallback string
-	snippetPlaceholders  []snippetPlaceholder
-	snippetIndex         int
+	// Value-completion mode: typing filters the list without inserting into the query.
+	columnPickerValueMode   bool
+	columnPickerValuePrefix string
+	columnPickerValueCursor int
+	columnPickerValueCol    string
+	columnPickerValueTable  string
 	// Modal overlay: inspect selected row/value details
 	showInspect   bool
 	inspectTitle  string
@@ -207,6 +251,13 @@ type Model struct {
 
 	// Last copied text for fallback/status purposes
 	lastCopied string
+
+	// Ollama query generator modal
+	showOllamaGen    bool
+	ollamaInput      textinput.Model
+	ollamaResult     string
+	ollamaGenerating bool
+	ollamaErr        string
 }
 
 func newModel(cfg *config.Config) Model {
@@ -218,11 +269,11 @@ func newModel(cfg *config.Config) Model {
 
 	inputs[fieldDSN] = textinput.New()
 	inputs[fieldDSN].Placeholder = "/path/to/db.sqlite or postgres://user:pass@host/db"
-	inputs[fieldDSN].CharLimit = 256
+	inputs[fieldDSN].CharLimit = 2048
 
 	// Query textarea
 	ta := textarea.New()
-	ta.Placeholder = "Write SQL... ctrl+r runs, tab opens completions"
+	ta.Placeholder = "Write SQL — ctrl+r runs · tab completes"
 	ta.ShowLineNumbers = false
 	ta.SetWidth(60)
 	ta.SetHeight(6)
@@ -235,15 +286,30 @@ func newModel(cfg *config.Config) Model {
 	resultTable.SetStyles(newTableStyles())
 	resultTable.Blur()
 
+	browseDataTable := table.New()
+	browseDataTable.SetStyles(newTableStyles())
+	browseDataTable.Blur()
+
+	ollamaIn := textinput.New()
+	ollamaIn.Placeholder = "describe the query in plain English..."
+	ollamaIn.CharLimit = 512
+
 	return Model{
-		cfg:             cfg,
-		activeConnIdx:   -1,
-		focus:           panelLeft,
-		queryInput:      ta,
-		newConnInputs:   inputs,
-		schemaTable:     schemaTable,
-		resultTable:     resultTable,
-		queryHistoryIdx: -1,
+		cfg:                cfg,
+		activeConnIdx:      -1,
+		focus:              panelLeft,
+		queryInput:         ta,
+		newConnInputs:      inputs,
+		newConnEditIdx:     -1,
+		schemaTable:        schemaTable,
+		browseDataTable:    browseDataTable,
+		resultTable:        resultTable,
+		queryHistoryIdx:    -1,
+		columnValueCache:   make(map[string][]string),
+		columnValuePending: make(map[string]bool),
+		schemaCache:        make(map[string]*db.TableSchema),
+		schemaPending:      make(map[string]bool),
+		ollamaInput:        ollamaIn,
 	}
 }
 

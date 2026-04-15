@@ -1,5 +1,8 @@
 dbkit
 WORK.md
+work.md
+*.excalidraw
+.codex/
 # Allow release workflow even when .github is globally ignored
 !.github/
 !.github/workflows/

@@ -157,10 +157,13 @@ func (d *PostgresDB) RunQuery(query string) (*QueryResult, error) {
 		}
 		row := make([]string, len(cols))
 		for i, v := range vals {
-			if v == nil {
+			switch val := v.(type) {
+			case nil:
 				row[i] = "NULL"
-			} else {
-				row[i] = fmt.Sprintf("%v", v)
+			case []byte:
+				row[i] = string(val)
+			default:
+				row[i] = fmt.Sprintf("%v", val)
 			}
 		}
 		result.Rows = append(result.Rows, row)

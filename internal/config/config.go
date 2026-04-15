@@ -26,7 +26,14 @@ type Config struct {
 	Connections  []Connection            `json:"connections"`
 	QueryHistory map[string][]string     `json:"query_history,omitempty"`
 	SavedQueries map[string][]SavedQuery `json:"saved_queries,omitempty"`
+	OllamaHost   string                  `json:"ollama_host,omitempty"`
+	OllamaModel  string                  `json:"ollama_model,omitempty"`
 }
+
+const (
+	configDirMode  = 0o700
+	configFileMode = 0o600
+)
 
 func configPath() string {
 	home, _ := os.UserHomeDir()
@@ -61,20 +68,37 @@ func Load() (*Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
+	if cfg.IsEmpty() {
+		legacyCfg, err := loadConfigFile(legacyConfigPath())
+		if err == nil && !legacyCfg.IsEmpty() {
+			return legacyCfg, nil
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
 	return &cfg, nil
 }
 
-// Save writes config to disk.
+// Save writes config to disk. Refuses to overwrite a non-empty config
+// with an empty one to prevent accidental data loss.
 func (c *Config) Save() error {
 	path := configPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), configDirMode); err != nil {
 		return err
+	}
+	// Guard: never overwrite a config that has connections with an empty one.
+	if c.IsEmpty() {
+		existing, err := loadConfigFile(path)
+		if err == nil && !existing.IsEmpty() {
+			return fmt.Errorf("refusing to overwrite non-empty config with empty config")
+		}
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, configFileMode)
 }
 
 // AddConnection appends a new connection and saves.
@@ -87,6 +111,16 @@ func (c *Config) AddConnection(name, dbType, dsn string) Connection {
 	}
 	c.Connections = append(c.Connections, conn)
 	return conn
+}
+
+func (c *Config) UpdateConnection(idx int, name, dbType, dsn string) bool {
+	if idx < 0 || idx >= len(c.Connections) {
+		return false
+	}
+	c.Connections[idx].Name = name
+	c.Connections[idx].Type = dbType
+	c.Connections[idx].DSN = dsn
+	return true
 }
 
 // DeleteConnection removes a connection by index and saves.
@@ -177,4 +211,20 @@ func (c *Config) SaveQuery(connID, label, query string, limit int) {
 		saved = saved[:limit]
 	}
 	c.SavedQueries[connID] = saved
+}
+
+func (c *Config) IsEmpty() bool {
+	return len(c.Connections) == 0 && len(c.QueryHistory) == 0 && len(c.SavedQueries) == 0
+}
+
+func loadConfigFile(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }
