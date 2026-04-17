@@ -176,15 +176,13 @@ func (m Model) renderFooter() string {
 				add("esc", "blur")
 			}
 		} else {
-			add("↑/↓", m.dataSourceLabelPlural())
-			add("e", "editor")
-			add("enter", "view data")
+			add("enter", "editor")
 			add("g", "ai generate")
 			add("f", "templates")
 			add("x", "examples")
 			add("y", "recent")
 			add("u", "saved")
-			add("ctrl+l", "clear")
+			add("ctrl+r", "run")
 		}
 	case tabResults:
 		if m.focus == panelRight {
@@ -301,8 +299,10 @@ func (m Model) renderLeftPanel(w, h int) string {
 	switch m.activeTab {
 	case tabConnections:
 		return m.renderConnectionList(w, h)
-	case tabBrowse, tabQuery:
+	case tabBrowse:
 		return m.renderTableList(w, h)
+	case tabQuery:
+		return m.renderQueryCheatSheet(w, h)
 	case tabResults:
 		return m.renderLastRunQuery(w, h)
 	case tabHistory:
@@ -361,6 +361,62 @@ func (m Model) renderTableList(w, h int) string {
 		} else {
 			lines = append(lines, " "+name)
 		}
+	}
+
+	return padLines(lines, h)
+}
+
+func (m Model) renderQueryCheatSheet(w, h int) string {
+	lines := []string{panelHeaderStyle.Render("Query Reference"), ""}
+
+	dbType := ""
+	if m.activeDB != nil {
+		dbType = m.activeDB.Type()
+	}
+
+	section := func(title string) string {
+		return accentStyle.Render(title)
+	}
+	ex := func(s string) string {
+		return dimStyle.Render("  " + s)
+	}
+
+	switch dbType {
+	case "mongo":
+		lines = append(lines, section("Syntax"))
+		lines = append(lines, ex("db.<col>.find({})"))
+		lines = append(lines, ex("db.<col>.find({k: \"v\"})"))
+		lines = append(lines, ex("db.<col>.aggregate(["))
+		lines = append(lines, ex("  {$match: {k: \"v\"}}"))
+		lines = append(lines, ex("])"))
+		lines = append(lines, ex("db.<col>.insertOne({})"))
+		lines = append(lines, ex("db.<col>.updateOne("))
+		lines = append(lines, ex("  {filter}, {$set: {…}})"))
+		lines = append(lines, ex("db.<col>.deleteMany({})"))
+		lines = append(lines, "")
+		lines = append(lines, section("Operators"))
+		lines = append(lines, ex("$eq $ne $gt $gte $lt $lte"))
+		lines = append(lines, ex("$in $nin $exists $regex"))
+		lines = append(lines, ex("$and $or $not"))
+		lines = append(lines, ex("$set $unset $inc $push"))
+	default:
+		lines = append(lines, section("Syntax"))
+		lines = append(lines, ex("SELECT * FROM t LIMIT 50;"))
+		lines = append(lines, ex("SELECT c1, c2 FROM t"))
+		lines = append(lines, ex("  WHERE c1 = 'v';"))
+		lines = append(lines, ex("INSERT INTO t (c1)"))
+		lines = append(lines, ex("  VALUES ('v');"))
+		lines = append(lines, ex("UPDATE t SET c1 = 'v'"))
+		lines = append(lines, ex("  WHERE id = 1;"))
+		lines = append(lines, ex("DELETE FROM t WHERE …;"))
+		lines = append(lines, "")
+		lines = append(lines, section("Joins"))
+		lines = append(lines, ex("… JOIN t2 ON t.id=t2.fk"))
+		lines = append(lines, ex("LEFT JOIN / RIGHT JOIN"))
+		lines = append(lines, "")
+		lines = append(lines, section("Aggregates"))
+		lines = append(lines, ex("COUNT(*) SUM() AVG()"))
+		lines = append(lines, ex("GROUP BY c HAVING …"))
 	}
 
 	return padLines(lines, h)
@@ -997,7 +1053,7 @@ func (m Model) renderCompletionPopover(w int) []string {
 	for i := start; i < end; i++ {
 		item := m.columnPickerItems[i]
 		marker := "[ ]"
-		if item.selected {
+		if item.Selected {
 			marker = "[x]"
 		}
 		if !m.columnPickerMulti {
@@ -1006,10 +1062,10 @@ func (m Model) renderCompletionPopover(w int) []string {
 				marker = " ▸ "
 			}
 		}
-		label := truncate(item.label, max(10, rowW-20))
+		label := truncate(item.Label, max(10, rowW-20))
 		row := marker + " " + label
-		if item.detail != "" {
-			row += "  " + dimStyle.Render(truncate(item.detail, 18))
+		if item.Detail != "" {
+			row += "  " + dimStyle.Render(truncate(item.Detail, 18))
 		}
 		if i == m.columnPickerCursor {
 			lines = append(lines, selectedItemStyle.Render(" "+padRight(row, rowW)+" "))

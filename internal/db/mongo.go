@@ -108,8 +108,13 @@ func (d *MongoDB) GetTableSchema(collection string) (*TableSchema, error) {
 		return nil, err
 	}
 
-	findOpts := options.Find().SetLimit(mongoSampleLimit)
-	cur, err := coll.Find(ctx, bson.D{}, findOpts)
+	// Use $sample aggregation to get documents from across the collection,
+	// not just the first N. This discovers fields that only exist in newer
+	// or less common documents.
+	pipeline := mongo.Pipeline{
+		{{Key: "$sample", Value: bson.D{{Key: "size", Value: mongoSampleLimit}}}},
+	}
+	cur, err := coll.Aggregate(ctx, pipeline)
 	if err != nil {
 		return nil, err
 	}

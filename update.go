@@ -6,8 +6,6 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +17,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"dbkit/internal/completion"
 	"dbkit/internal/config"
 	"dbkit/internal/db"
 	"dbkit/internal/ollama"
@@ -310,9 +309,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "3":
 			if m.activeDB != nil {
 				m.activeTab = tabQuery
-				m.focus = panelLeft
-				m.queryFocus = false
-				m.queryInput.Blur()
+				m.focus = panelRight
+				m.queryFocus = true
+				m.queryInput.Focus()
 				m.syncTableFocus()
 			}
 			return m, nil
@@ -595,13 +594,8 @@ func (m Model) updateQuery(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg.String() {
-	case "j", "down":
-		return m.moveTableCursor(1)
-	case "k", "up":
-		return m.moveTableCursor(-1)
-	case "enter":
-		return m.runDefaultBrowseQuery()
-	case "e":
+	case "e", "enter", "j", "k", "down", "up":
+		// Left panel is a static cheat sheet — any nav key focuses the editor
 		m.queryFocus = true
 		m.focus = panelRight
 		m.queryInput.Focus()
@@ -1563,16 +1557,14 @@ func extractSelectTable(query string) string {
 	return unquoteIdentifier(rest[:end])
 }
 
-// queryInferredTable returns the table most relevant to the current query editor context:
-// the FROM-clause table if parseable, the write-query target table, otherwise the left-panel cursor table.
+// queryInferredTable returns the table referenced in the query editor text:
+// the FROM-clause table if parseable, or the write-query target table.
+// Returns "" when no table can be parsed — never falls back to the browse panel.
 func (m Model) queryInferredTable() string {
 	if table := extractSelectTable(m.queryInput.Value()); table != "" {
 		return table
 	}
-	if table := extractTableFromQuery(m.queryInput.Value()); table != "" {
-		return table
-	}
-	return m.currentTableName()
+	return extractTableFromQuery(m.queryInput.Value())
 }
 
 // extractTableFromQuery parses the target table/collection from supported SQL and Mongo commands.
@@ -2388,35 +2380,109 @@ func indexOfString(items []string, needle string) int {
 	return 0
 }
 
-type queryColumnContext struct {
-	start        int
-	end          int
-	title        string
-	multi        bool
-	includeStar  bool
-	fallback     string
-	filterSuffix string // appended after insertion (e.g. WHERE column -> " = ''")
-	valueMode    bool   // value completion: typing filters list, does NOT insert into query
-	valueCol     string // column whose values are being completed (value mode)
-	valueTable   string // table whose values are being completed (value mode)
+// --- Completion engine adapter ---
+
+// buildCompletionRequest builds a completion.Request from the current Model state.
+func (m *Model) buildCompletionRequest() completion.Request {
+	req := completion.Request{
+		Query:         m.queryInput.Value(),
+		Cursor:        m.queryCursorIndex(),
+		DBType:        "",
+		Tables:        m.tables,
+		Schema:        m.resolveSchemaForCompletion(),
+		ValueCache:    m.completionValueCache(),
+		InferredTable: m.queryInferredTable(),
+	}
+	if m.activeDB != nil {
+		req.DBType = m.activeDB.Type()
+	}
+	return req
 }
 
-var sqlPredicateOperatorPattern = regexp.MustCompile(`(?i)(?:"[^"]+"|[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)\s*$`)
+// resolveSchemaForCompletion returns the schema for the query-inferred table,
+// preferring the cache (keyed by connIdx|table) over the browse panel's
+// tableSchema. This is the fix for the stale collection bug — we always
+// resolve based on what the query text targets, not the browse cursor.
+func (m *Model) resolveSchemaForCompletion() *completion.SchemaInfo {
+	inferred := m.queryInferredTable()
+	if inferred == "" {
+		return nil
+	}
+	// Always prefer cache — keyed by connIdx|table, always correct
+	key := schemaCacheKey(m.activeConnIdx, inferred)
+	if cached := m.schemaCache[key]; cached != nil {
+		return m.dbSchemaToCompletionSchema(cached)
+	}
+	// Only use browse panel schema if it matches the inferred table
+	if m.tableSchema != nil && strings.EqualFold(m.tableSchema.Name, inferred) {
+		return m.dbSchemaToCompletionSchema(m.tableSchema)
+	}
+	return nil
+}
+
+func (m *Model) toSchemaInfo(s *db.TableSchema) *completion.SchemaInfo {
+	if s == nil {
+		return nil
+	}
+	return m.dbSchemaToCompletionSchema(s)
+}
+
+func (m *Model) dbSchemaToCompletionSchema(s *db.TableSchema) *completion.SchemaInfo {
+	if s == nil {
+		return nil
+	}
+	cols := make([]completion.ColumnInfo, len(s.Columns))
+	for i, c := range s.Columns {
+		cols[i] = completion.ColumnInfo{Name: c.Name, Type: c.Type, PrimaryKey: c.PrimaryKey}
+	}
+	return &completion.SchemaInfo{Name: s.Name, Columns: cols}
+}
+
+// completionValueCache returns a value cache keyed by "table|col" (no connIdx
+// prefix) so the engine doesn't need to know about connection indices.
+func (m *Model) completionValueCache() map[string][]string {
+	out := make(map[string][]string, len(m.columnValueCache))
+	prefix := fmt.Sprintf("%d|", m.activeConnIdx)
+	for k, v := range m.columnValueCache {
+		if strings.HasPrefix(k, prefix) {
+			out[k[len(prefix):]] = v
+		}
+	}
+	return out
+}
 
 func (m *Model) openCompletionForCursor(manual bool) (bool, tea.Cmd) {
-	ctx, items, cmd, ok := m.completionItemsForCursor()
-	if !ok {
+	if m.activeDB == nil {
 		if manual {
 			m.setStatus("completion unavailable here")
 		}
 		return false, nil
 	}
-	if len(items) == 0 {
-		// If an async load (schema or values) is in flight, show a "loading"
-		// row so the picker opens and refreshes when the data arrives.
+	result := completion.Complete(m.buildCompletionRequest())
+	if result == nil {
+		if manual {
+			m.setStatus("no completion items available")
+		}
+		return false, nil
+	}
+	// Handle async needs
+	var cmd tea.Cmd
+	if result.NeedSchema != "" {
+		cmd = m.loadSchemaForCache(result.NeedSchema)
+	}
+	if result.NeedValues != nil {
+		valCmd := m.loadColumnValues(result.NeedValues.Table, result.NeedValues.Column)
 		if cmd != nil {
-			token := currentTokenValue([]rune(m.queryInput.Value())[ctx.start:ctx.end])
-			items = []columnPickerItem{{label: "loading…", detail: "fetching schema / values", insertText: token}}
+			cmd = tea.Batch(cmd, valCmd)
+		} else {
+			cmd = valCmd
+		}
+	}
+	if len(result.Items) == 0 {
+		if cmd != nil {
+			// Async load in flight — show loading placeholder
+			token := completion.TokenValue([]rune(m.queryInput.Value())[result.Start:result.End])
+			result.Items = []completion.Item{{Label: "loading…", Detail: "fetching schema / values", InsertText: token}}
 		} else {
 			if manual {
 				m.setStatus("no completion items available")
@@ -2424,18 +2490,18 @@ func (m *Model) openCompletionForCursor(manual bool) (bool, tea.Cmd) {
 			return false, nil
 		}
 	}
-	m.columnPickerTitle = ctx.title
-	m.columnPickerItems = items
+	m.columnPickerTitle = result.Title
+	m.columnPickerItems = result.Items
 	m.columnPickerCursor = 0
-	m.columnPickerMulti = ctx.multi
-	m.columnPickerStart = ctx.start
-	m.columnPickerEnd = ctx.end
-	m.columnPickerFallback = ctx.fallback
-	m.columnPickerValueMode = ctx.valueMode
+	m.columnPickerMulti = result.Multi
+	m.columnPickerStart = result.Start
+	m.columnPickerEnd = result.End
+	m.columnPickerFallback = result.Fallback
+	m.columnPickerValueMode = result.ValueMode
 	m.columnPickerValuePrefix = ""
 	m.columnPickerValueCursor = 0
-	m.columnPickerValueCol = ctx.valueCol
-	m.columnPickerValueTable = ctx.valueTable
+	m.columnPickerValueCol = result.ValueCol
+	m.columnPickerValueTable = result.ValueTable
 	m.showColumnPicker = true
 	return true, cmd
 }
@@ -2444,34 +2510,38 @@ func (m *Model) refreshCompletionPicker(manual bool) (bool, tea.Cmd) {
 	if !m.showColumnPicker {
 		return m.openCompletionForCursor(manual)
 	}
-	// In value mode, only refresh the item list from cache and keep the current
-	// replacement range stable.
 	if m.columnPickerValueMode {
 		m.refilterValuePicker()
 		return true, nil
 	}
-	ctx, items, cmd, ok := m.completionItemsForCursor()
-	if !ok {
+	result := completion.Complete(m.buildCompletionRequest())
+	if result == nil || len(result.Items) == 0 {
 		m.showColumnPicker = false
 		return false, nil
 	}
-	if len(items) == 0 {
-		m.showColumnPicker = false
-		return false, nil
+	var cmd tea.Cmd
+	if result.NeedSchema != "" {
+		cmd = m.loadSchemaForCache(result.NeedSchema)
 	}
-	m.columnPickerTitle = ctx.title
-	m.columnPickerItems = items
+	if result.NeedValues != nil {
+		valCmd := m.loadColumnValues(result.NeedValues.Table, result.NeedValues.Column)
+		if cmd != nil {
+			cmd = tea.Batch(cmd, valCmd)
+		} else {
+			cmd = valCmd
+		}
+	}
+	m.columnPickerTitle = result.Title
+	m.columnPickerItems = result.Items
 	m.columnPickerCursor = 0
 	m.columnPickerMulti = false
-	m.columnPickerStart = ctx.start
-	m.columnPickerEnd = ctx.end
-	m.columnPickerFallback = ctx.fallback
+	m.columnPickerStart = result.Start
+	m.columnPickerEnd = result.End
+	m.columnPickerFallback = result.Fallback
 	m.showColumnPicker = true
 	return true, cmd
 }
 
-// refilterValuePicker re-fetches cached values and applies the current prefix
-// filter, without changing the picker's insertion range (start/end).
 func (m *Model) refilterValuePicker() {
 	if m.columnPickerValueCol == "" {
 		return
@@ -2479,16 +2549,16 @@ func (m *Model) refilterValuePicker() {
 	m.columnPickerValueCursor = clampInt(m.columnPickerValueCursor, 0, len([]rune(m.columnPickerValuePrefix)))
 	key := columnValueKey(m.activeConnIdx, m.columnPickerValueTable, m.columnPickerValueCol)
 	values := m.columnValueCache[key]
-	items := make([]columnPickerItem, 0, len(values))
+	items := make([]completion.Item, 0, len(values))
 	for _, v := range values {
-		items = append(items, columnPickerItem{label: v, detail: m.columnPickerValueCol, insertText: v})
+		items = append(items, completion.Item{Label: v, Detail: m.columnPickerValueCol, InsertText: v})
 	}
-	items = rankCompletionItems(m.columnPickerValuePrefix, items)
+	items = completion.RankItems(m.columnPickerValuePrefix, items)
 	if len(items) == 0 {
 		if values == nil {
-			items = []columnPickerItem{{label: "loading…", detail: "fetching samples", insertText: m.columnPickerValuePrefix}}
+			items = []completion.Item{{Label: "loading…", Detail: "fetching samples", InsertText: m.columnPickerValuePrefix}}
 		} else {
-			items = []columnPickerItem{{label: "(no samples)", detail: m.columnPickerValueCol, insertText: m.columnPickerValuePrefix}}
+			items = []completion.Item{{Label: "(no samples)", Detail: m.columnPickerValueCol, InsertText: m.columnPickerValuePrefix}}
 		}
 	}
 	m.columnPickerItems = items
@@ -2497,1813 +2567,53 @@ func (m *Model) refilterValuePicker() {
 	}
 }
 
-func (m *Model) completionItemsForCursor() (queryColumnContext, []columnPickerItem, tea.Cmd, bool) {
-	if m.activeDB == nil {
-		return queryColumnContext{}, nil, nil, false
-	}
-	before := strings.ToLower(m.queryBeforeCursor())
-	if m.activeDB.Type() == "mongo" {
-		ctx, items, cmd, ok := m.mongoCompletionContext()
-		return ctx, items, cmd, ok
-	}
-	if inInsertValuesList(before) {
-		return queryColumnContext{}, nil, nil, false
-	}
-	if ctx, items, cmd, ok := m.queryValueCompletionContext(); ok {
-		return ctx, items, cmd, true
-	}
-	if cursorInsideString(m.queryInput.Value(), m.queryCursorIndex()) {
-		return queryColumnContext{}, nil, nil, false
-	}
-	if ctx, items, ok := m.sqlOperatorCompletionContext(); ok {
-		return ctx, items, nil, true
-	}
-	if ctx, ok := m.queryColumnContext(); ok {
-		// If the schema doesn't match the table in the query, trigger a cache-only
-		// load so autocomplete gets fresh fields without clobbering the left-panel
-		// tableSchema the user has pinned to a different collection.
-		var schemaCmd tea.Cmd
-		inferred := m.queryInferredTable()
-		if inferred != "" {
-			if m.tableSchema == nil || !strings.EqualFold(m.tableSchema.Name, inferred) {
-				if m.schemaCache[schemaCacheKey(m.activeConnIdx, inferred)] == nil {
-					schemaCmd = m.loadSchemaForCache(inferred)
-				}
-			}
-		}
-		items := m.columnPickerCandidates(ctx)
-		if len(items) == 0 && schemaCmd != nil {
-			items = []columnPickerItem{{label: "loading fields…", detail: inferred, insertText: ""}}
-		}
-		return ctx, items, schemaCmd, true
-	}
-	if ctx, ok := m.queryTableContext(); ok {
-		return ctx, m.tablePickerCandidates(ctx), nil, true
-	}
-	if ctx, items, ok := m.sqlClauseValueCompletionContext(); ok {
-		return ctx, items, nil, true
-	}
-	ctx, items, ok := m.sqlKeywordCompletionContext()
-	return ctx, items, nil, ok
-}
-
-func (m Model) sqlOperatorCompletionContext() (queryColumnContext, []columnPickerItem, bool) {
-	query := []rune(m.queryInput.Value())
-	cursor := m.queryCursorIndex()
-	start, end := queryTokenBounds(query, cursor)
-	beforeToken := strings.ToLower(string(query[:start]))
-	prefix := strings.ToLower(currentTokenValue(query[start:end]))
-
-	if !inWhereClause(beforeToken) && !inUpdateSetList(beforeToken) {
-		return queryColumnContext{}, nil, false
-	}
-	if prefix != "" {
-		for _, r := range prefix {
-			if !unicode.IsLetter(r) && r != '!' && r != '<' && r != '>' && r != '=' {
-				return queryColumnContext{}, nil, false
-			}
-		}
-	}
-	if !sqlPredicateOperatorPattern.MatchString(beforeToken) {
-		return queryColumnContext{}, nil, false
-	}
-
-	items := []columnPickerItem{
-		{label: "=", detail: "equals", insertText: "= ''"},
-		{label: "!=", detail: "not equal", insertText: "!= ''"},
-		{label: ">", detail: "greater than", insertText: "> 0"},
-		{label: ">=", detail: "greater or equal", insertText: ">= 0"},
-		{label: "<", detail: "less than", insertText: "< 0"},
-		{label: "<=", detail: "less or equal", insertText: "<= 0"},
-		{label: "LIKE", detail: "pattern match", insertText: "LIKE '%%'"},
-		{label: "IN", detail: "set membership", insertText: "IN ('')"},
-		{label: "IS NULL", detail: "null check", insertText: "IS NULL"},
-		{label: "IS NOT NULL", detail: "not null check", insertText: "IS NOT NULL"},
-	}
-	return queryColumnContext{
-		start:    start,
-		end:      end,
-		title:    "Operator",
-		fallback: currentTokenValue(query[start:end]),
-	}, rankCompletionItems(prefix, items), true
-}
-
-func (m Model) tablePickerCandidates(ctx queryColumnContext) []columnPickerItem {
-	prefix := strings.ToLower(currentTokenValue([]rune(m.queryInput.Value())[ctx.start:ctx.end]))
-	items := make([]columnPickerItem, 0, len(m.tables))
-	for _, name := range m.tables {
-		items = append(items, columnPickerItem{
-			label:      name,
-			detail:     m.dataSourceLabel(),
-			insertText: quoteIdentifierForDB(m.activeDB, name),
-		})
-	}
-	return rankCompletionItems(prefix, items)
-}
-
-func (m Model) sqlKeywordCompletionContext() (queryColumnContext, []columnPickerItem, bool) {
-	query := []rune(m.queryInput.Value())
-	cursor := m.queryCursorIndex()
-	start, end := queryTokenBounds(query, cursor)
-	token := strings.ToLower(currentTokenValue(query[start:end]))
-	beforeToken := strings.ToLower(string(query[:start]))
-	trimmed := strings.TrimSpace(beforeToken)
-	if trimmed != "" && token == "" {
-		return queryColumnContext{}, nil, false
-	}
-	if token != "" {
-		for _, r := range token {
-			if !unicode.IsLetter(r) {
-				return queryColumnContext{}, nil, false
-			}
-		}
-	}
-	title := "SQL Snippets"
-	switch {
-	case trimmed == "":
-		title = "SQL Starters"
-	case strings.HasSuffix(trimmed, "from") || strings.HasSuffix(trimmed, "join") || strings.HasSuffix(trimmed, "where") || strings.HasSuffix(trimmed, "group by") || strings.HasSuffix(trimmed, "order by"):
-		title = "SQL Clauses"
-	default:
-		title = "SQL Keywords"
-	}
-	items := m.sqlKeywordCompletionItems()
-	if trimmed == "" {
-		for _, name := range m.tables {
-			items = append(items, columnPickerItem{
-				label:      name,
-				detail:     m.dataSourceLabel(),
-				insertText: fmt.Sprintf("SELECT * FROM %s LIMIT 50;", quoteIdentifierForDB(m.activeDB, name)),
-			})
-		}
-	}
-	items = rankCompletionItems(token, items)
-	if len(items) == 0 {
-		return queryColumnContext{}, nil, false
-	}
-	return queryColumnContext{start: start, end: end, title: title, fallback: currentTokenValue(query[start:end])}, items, true
-}
-
-func (m Model) sqlKeywordCompletionItems() []columnPickerItem {
-	table := fallbackTableName(m.currentTableName())
-	filterCol := fallbackColumnName(m.preferredFilterColumn())
-	sortCol := fallbackColumnName(m.preferredSortColumn())
-	before := strings.ToLower(m.queryBeforeCursor())
-	items := []columnPickerItem{
-		{label: "SELECT starter", detail: "query", insertText: fmt.Sprintf("SELECT *\nFROM %s\nLIMIT 50;", quoteIdentifierForDB(m.activeDB, table))},
-		{label: "INSERT starter", detail: "query", insertText: fmt.Sprintf("INSERT INTO %s (%s)\nVALUES ('');", quoteIdentifierForDB(m.activeDB, table), quoteIdentifierForDB(m.activeDB, filterCol))},
-		{label: "UPDATE starter", detail: "query", insertText: fmt.Sprintf("UPDATE %s\nSET %s = ''\nWHERE %s = '';", quoteIdentifierForDB(m.activeDB, table), quoteIdentifierForDB(m.activeDB, filterCol), quoteIdentifierForDB(m.activeDB, filterCol))},
-		{label: "DELETE starter", detail: "query", insertText: fmt.Sprintf("DELETE FROM %s\nWHERE %s = '';", quoteIdentifierForDB(m.activeDB, table), quoteIdentifierForDB(m.activeDB, filterCol))},
-		{label: "JOIN clause", detail: "query", insertText: fmt.Sprintf("JOIN %s ON ", quoteIdentifierForDB(m.activeDB, table))},
-		{label: "WHERE clause", detail: "query", insertText: fmt.Sprintf("WHERE %s = ''", quoteIdentifierForDB(m.activeDB, filterCol))},
-		{label: "GROUP BY clause", detail: "query", insertText: fmt.Sprintf("GROUP BY %s", quoteIdentifierForDB(m.activeDB, filterCol))},
-		{label: "ORDER BY clause", detail: "query", insertText: fmt.Sprintf("ORDER BY %s DESC", quoteIdentifierForDB(m.activeDB, sortCol))},
-		{label: "LIMIT clause", detail: "query", insertText: "LIMIT 50"},
-		{label: "SELECT", detail: "keyword", insertText: "SELECT"},
-		{label: "FROM", detail: "keyword", insertText: "FROM"},
-		{label: "WHERE", detail: "keyword", insertText: "WHERE"},
-		{label: "JOIN", detail: "keyword", insertText: "JOIN"},
-		{label: "GROUP BY", detail: "keyword", insertText: "GROUP BY"},
-		{label: "ORDER BY", detail: "keyword", insertText: "ORDER BY"},
-		{label: "LIMIT", detail: "keyword", insertText: "LIMIT"},
-		{label: "INSERT INTO", detail: "keyword", insertText: "INSERT INTO"},
-		{label: "UPDATE", detail: "keyword", insertText: "UPDATE"},
-		{label: "DELETE FROM", detail: "keyword", insertText: "DELETE FROM"},
-	}
-	if inSelectList(before) {
-		items = append(items,
-			columnPickerItem{label: "COUNT(*)", detail: "aggregate", insertText: "COUNT(*)"},
-			columnPickerItem{label: "COUNT(col)", detail: "aggregate", insertText: fmt.Sprintf("COUNT(%s)", quoteIdentifierForDB(m.activeDB, filterCol))},
-			columnPickerItem{label: "SUM(col)", detail: "aggregate", insertText: fmt.Sprintf("SUM(%s)", quoteIdentifierForDB(m.activeDB, filterCol))},
-			columnPickerItem{label: "AVG(col)", detail: "aggregate", insertText: fmt.Sprintf("AVG(%s)", quoteIdentifierForDB(m.activeDB, filterCol))},
-			columnPickerItem{label: "MIN(col)", detail: "aggregate", insertText: fmt.Sprintf("MIN(%s)", quoteIdentifierForDB(m.activeDB, sortCol))},
-			columnPickerItem{label: "MAX(col)", detail: "aggregate", insertText: fmt.Sprintf("MAX(%s)", quoteIdentifierForDB(m.activeDB, sortCol))},
-			columnPickerItem{label: "DISTINCT col", detail: "modifier", insertText: fmt.Sprintf("DISTINCT %s", quoteIdentifierForDB(m.activeDB, filterCol))},
-		)
-	}
-	return items
-}
-
-func (m Model) queryBeforeCursor() string {
-	q := []rune(m.queryInput.Value())
-	c := m.queryCursorIndex()
-	if c > len(q) {
-		c = len(q)
-	}
-	if c < 0 {
-		c = 0
-	}
-	return string(q[:c])
-}
-
-// cursorInsideString reports whether the cursor sits inside an unclosed
-// single- or double-quoted string literal. Used to suppress keyword/column
-// completion inside literal values (which are handled by the value-completion
-// path when preceded by a comparison).
-func cursorInsideString(query string, cursor int) bool {
-	runes := []rune(query)
-	if cursor > len(runes) {
-		cursor = len(runes)
-	}
-	inQuote := false
-	var quote rune
-	for i := 0; i < cursor; i++ {
-		r := runes[i]
-		if inQuote {
-			if r == quote {
-				// Handle SQL-style escape ('')
-				if r == '\'' && i+1 < cursor && runes[i+1] == '\'' {
-					i++
-					continue
-				}
-				inQuote = false
-			}
-			continue
-		}
-		if r == '\'' || r == '"' {
-			inQuote = true
-			quote = r
-		}
-	}
-	return inQuote
-}
-
-// findOpenQuote returns the position of the unclosed quote rune before the
-// cursor, the quote char, and whether one was found.
-func findOpenQuote(runes []rune, cursor int) (int, rune, bool) {
-	if cursor > len(runes) {
-		cursor = len(runes)
-	}
-	inQuote := false
-	var quote rune
-	openIdx := -1
-	for i := 0; i < cursor; i++ {
-		r := runes[i]
-		if inQuote {
-			if r == quote {
-				if r == '\'' && i+1 < cursor && runes[i+1] == '\'' {
-					i++
-					continue
-				}
-				inQuote = false
-			}
-			continue
-		}
-		if r == '\'' || r == '"' {
-			inQuote = true
-			quote = r
-			openIdx = i
-		}
-	}
-	if !inQuote {
-		return -1, 0, false
-	}
-	return openIdx, quote, true
-}
-
-var valueOpPattern = regexp.MustCompile(`(?i)(?:^|[\s,(])((?:"[^"]+"|[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?))\s*(?:=|!=|<>|<=|>=|<|>|\bLIKE\b|\bILIKE\b|\bIN\s*\(\s*)[^=<>!]*$`)
-
-// columnBeforeValueLiteral returns the column name implied by the operator
-// sequence immediately preceding the opening quote, or "" if none.
-func columnBeforeValueLiteral(before string) string {
-	match := valueOpPattern.FindStringSubmatch(before)
-	if len(match) < 2 {
-		return ""
-	}
-	col := strings.Trim(match[1], `"`)
-	if idx := strings.LastIndex(col, "."); idx >= 0 {
-		col = col[idx+1:]
-	}
-	return col
-}
-
-func (m *Model) queryValueCompletionContext() (queryColumnContext, []columnPickerItem, tea.Cmd, bool) {
-	runes := []rune(m.queryInput.Value())
-	cursor := m.queryCursorIndex()
-	openIdx, _, ok := findOpenQuote(runes, cursor)
-	if !ok {
-		return queryColumnContext{}, nil, nil, false
-	}
-	before := string(runes[:openIdx])
-	col := columnBeforeValueLiteral(before)
-	if col == "" {
-		return queryColumnContext{}, nil, nil, false
-	}
-	table := m.queryInferredTable()
-	if table == "" {
-		return queryColumnContext{}, nil, nil, false
-	}
-	key := columnValueKey(m.activeConnIdx, table, col)
-	values, cached := m.columnValueCache[key]
-	var cmd tea.Cmd
-	if !cached {
-		cmd = m.loadColumnValues(table, col)
-	}
-	prefix := strings.ToLower(string(runes[openIdx+1 : cursor]))
-	items := make([]columnPickerItem, 0, len(values)+1)
-	for _, v := range values {
-		items = append(items, columnPickerItem{label: v, detail: col, insertText: v})
-	}
-	items = rankCompletionItems(prefix, items)
-	if !cached && len(items) == 0 {
-		items = append(items, columnPickerItem{label: "loading…", detail: "fetching samples", insertText: prefix})
-	}
-	if len(items) == 0 {
-		items = append(items, columnPickerItem{label: "(no samples)", detail: col, insertText: prefix})
-	}
-	ctx := queryColumnContext{
-		start:      openIdx + 1,
-		end:        cursor,
-		title:      "Values for " + col,
-		fallback:   prefix,
-		valueMode:  true,
-		valueCol:   col,
-		valueTable: m.queryInferredTable(),
-	}
-	return ctx, items, cmd, true
-}
-
-func (m Model) schemaHasColumn(name string) bool {
-	lower := strings.ToLower(name)
-	if m.tableSchema != nil {
-		for _, col := range m.tableSchema.Columns {
-			if strings.ToLower(col.Name) == lower {
-				return true
-			}
-		}
-	}
-	// Fall back to result columns when schema isn't loaded.
-	if m.queryResult != nil {
-		for _, col := range m.queryResult.Columns {
-			if strings.ToLower(col) == lower {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (m Model) queryColumnContext() (queryColumnContext, bool) {
-	query := []rune(m.queryInput.Value())
-	cursor := m.queryCursorIndex()
-	start, end := queryTokenBounds(query, cursor)
-	beforeToken := strings.ToLower(string(query[:start]))
-	trimmed := strings.TrimSpace(beforeToken)
-
-	switch {
-	case inSelectList(beforeToken):
-		return queryColumnContext{
-			start:       start,
-			end:         end,
-			title:       "Select Columns",
-			multi:       true,
-			includeStar: true,
-			fallback:    "*",
-		}, true
-	case inWhereClause(beforeToken):
-		return queryColumnContext{
-			start:        start,
-			end:          end,
-			title:        "Filter Column",
-			multi:        false,
-			fallback:     currentTokenValue(query[start:end]),
-			filterSuffix: " = ''",
-		}, true
-	case inOrderByList(beforeToken):
-		if orderByWantsDirection(beforeToken) {
-			return queryColumnContext{}, false
-		}
-		return queryColumnContext{
-			start:    start,
-			end:      end,
-			title:    "Order By Columns",
-			multi:    true,
-			fallback: currentTokenValue(query[start:end]),
-		}, true
-	case inGroupByList(beforeToken):
-		return queryColumnContext{
-			start:    start,
-			end:      end,
-			title:    "Group By Columns",
-			multi:    true,
-			fallback: currentTokenValue(query[start:end]),
-		}, true
-	case inInsertColumnList(beforeToken):
-		return queryColumnContext{
-			start:    start,
-			end:      end,
-			title:    "Insert Columns",
-			multi:    true,
-			fallback: currentTokenValue(query[start:end]),
-		}, true
-	case inUpdateSetList(beforeToken):
-		return queryColumnContext{
-			start:    start,
-			end:      end,
-			title:    "Set Columns",
-			multi:    false,
-			fallback: currentTokenValue(query[start:end]),
-		}, true
-	case trimmed == "":
-		return queryColumnContext{}, false
-	default:
-		return queryColumnContext{}, false
-	}
-}
-
-func (m Model) queryTableContext() (queryColumnContext, bool) {
-	query := []rune(m.queryInput.Value())
-	cursor := m.queryCursorIndex()
-	start, end := queryTokenBounds(query, cursor)
-	beforeToken := strings.ToLower(string(query[:start]))
-	switch {
-	case inFromTable(beforeToken):
-		return queryColumnContext{start: start, end: end, title: "From Table", fallback: currentTokenValue(query[start:end])}, true
-	case inJoinTable(beforeToken):
-		return queryColumnContext{start: start, end: end, title: "Join Table", fallback: currentTokenValue(query[start:end])}, true
-	case inUpdateTable(beforeToken):
-		return queryColumnContext{start: start, end: end, title: "Update Table", fallback: currentTokenValue(query[start:end])}, true
-	case inInsertIntoTable(beforeToken):
-		return queryColumnContext{start: start, end: end, title: "Insert Into", fallback: currentTokenValue(query[start:end])}, true
-	case inDeleteFromTable(beforeToken):
-		return queryColumnContext{start: start, end: end, title: "Delete From", fallback: currentTokenValue(query[start:end])}, true
-	default:
-		return queryColumnContext{}, false
-	}
-}
-
-func (m Model) sqlClauseValueCompletionContext() (queryColumnContext, []columnPickerItem, bool) {
-	query := []rune(m.queryInput.Value())
-	cursor := m.queryCursorIndex()
-	start, end := queryTokenBounds(query, cursor)
-	beforeToken := strings.ToLower(string(query[:start]))
-	prefix := strings.ToLower(currentTokenValue(query[start:end]))
-
-	if inLimitValue(beforeToken) {
-		items := []columnPickerItem{
-			{label: "10", detail: "limit", insertText: "10"},
-			{label: "20", detail: "limit", insertText: "20"},
-			{label: "50", detail: "limit", insertText: "50"},
-			{label: "100", detail: "limit", insertText: "100"},
-			{label: "200", detail: "limit", insertText: "200"},
-			{label: "500", detail: "limit", insertText: "500"},
-			{label: "1000", detail: "limit", insertText: "1000"},
-		}
-		return queryColumnContext{
-			start:    start,
-			end:      end,
-			title:    "Limit",
-			fallback: currentTokenValue(query[start:end]),
-		}, rankCompletionItems(prefix, items), true
-	}
-	if orderByWantsDirection(beforeToken) {
-		items := []columnPickerItem{
-			{label: "ASC", detail: "direction", insertText: "ASC"},
-			{label: "DESC", detail: "direction", insertText: "DESC"},
-		}
-		return queryColumnContext{
-			start:    start,
-			end:      end,
-			title:    "Order Direction",
-			fallback: strings.ToUpper(currentTokenValue(query[start:end])),
-		}, rankCompletionItems(prefix, items), true
-	}
-	return queryColumnContext{}, nil, false
-}
-
-func (m Model) mongoCompletionContext() (queryColumnContext, []columnPickerItem, tea.Cmd, bool) {
-	query := m.queryInput.Value()
-	cursor := m.queryCursorIndex()
-	isShell := strings.HasPrefix(strings.TrimSpace(query), "db.")
-	tokens := mongoTokens(query)
-	tokenIdx := 0
-	start := cursor
-	end := cursor
-	found := false
-	// Find which token the cursor is inside. In shell format, tokens may not be
-	// position-ordered (method token comes first semantically but later in the string),
-	// so check all tokens instead of short-circuiting.
-	for i, token := range tokens {
-		if cursor >= token.start && cursor <= token.end {
-			tokenIdx = i
-			start = token.start
-			end = token.end
-			found = true
-			break
-		}
-	}
-	if !found {
-		// Cursor is between or after tokens — find the next token by position
-		bestIdx := -1
-		for i, token := range tokens {
-			if token.start > cursor {
-				if bestIdx < 0 || token.start < tokens[bestIdx].start {
-					bestIdx = i
-				}
-			}
-		}
-		if bestIdx >= 0 {
-			tokenIdx = bestIdx
-		} else if len(tokens) > 0 {
-			tokenIdx = len(tokens)
-		}
-	}
-	// Prefix is only the text from token start up to cursor — so when the cursor
-	// is at the start of a token, no prefix filter is applied.
-	prefix := ""
-	if start < cursor {
-		prefix = mongoCompletionPrefix(query[start:cursor])
-	}
-	command := ""
-	if len(tokens) > 0 {
-		command = strings.ToLower(tokens[0].value)
-	}
-	ctx := queryColumnContext{start: start, end: end, title: "Mongo Commands", fallback: strings.TrimSpace(query[start:end])}
-	var cmd tea.Cmd
-	var items []columnPickerItem
-	switch tokenIdx {
-	case 0:
-		ctx.title = "Mongo Commands"
-		// In shell format, prefer the collection already typed in the query
-		// (e.g. typing `db.users.find` + tab should keep `users`, not overwrite
-		// with the left-panel cursor's collection).
-		table := ""
-		if isShell {
-			table = mongoCollectionFromTokens(tokens)
-		}
-		if table == "" {
-			table = fallbackTableName(m.currentTableName())
-		}
-		items = mongoCommandItemsForCollection(table)
-		// In shell format, command items replace the entire query
-		if isShell {
-			ctx.start = 0
-			ctx.end = len([]rune(query))
-			ctx.fallback = query
-		}
-	case 1:
-		ctx.title = "Collections"
-		items = m.mongoCollectionItems()
-		if isShell {
-			// In shell format, collection is embedded in db.COLLECTION.method(...)
-			// The token positions already map to the right place, but we need to
-			// rebuild the surrounding shell expression when inserting.
-			// Use method-aware collection items that rebuild the query.
-			items = m.mongoShellCollectionItems(command, tokens)
-			ctx.start = 0
-			ctx.end = len([]rune(query))
-			ctx.fallback = query
-		}
-	default:
-		ctx.title = "Mongo Arguments"
-		collection := mongoCollectionFromTokens(tokens)
-		tokenText := strings.TrimSpace(query[start:end])
-		items, cmd = m.mongoArgumentItems(command, collection, tokenIdx, tokenText, cursor-start)
-		if strings.HasPrefix(tokenText, "{") && len(tokenText) > 1 {
-			if valueStart, valueEnd, ok := mongoJSONValueBounds(tokenText, cursor-start); ok {
-				ctx.title = "Mongo Value"
-				ctx.start = start + valueStart
-				ctx.end = start + valueEnd
-				ctx.fallback = string([]rune(query)[ctx.start:ctx.end])
-			}
-		}
-		if command == "find" && tokenIdx >= 4 {
-			ctx.title = "Sort"
-		}
-		if strings.HasPrefix(tokenText, "{") && len(tokenText) > 1 {
-			if field, ok := mongoJSONComparisonFieldContext(tokenText, cursor-start); ok && field != "" {
-				if opStart, opEnd, _, opOK := mongoJSONOperatorPairBounds(tokenText, cursor-start); opOK {
-					ctx.title = "Mongo Operator"
-					ctx.start = start + opStart
-					ctx.end = start + opEnd
-					ctx.fallback = strings.Trim(string([]rune(query)[ctx.start:ctx.end]), `"`)
-					prefix = ""
-				}
-			} else if keyStart, keyEnd, ok := mongoJSONKeyBounds(tokenText, cursor-start); ok {
-				ctx.title = "Mongo Field"
-				ctx.start = start + keyStart
-				ctx.end = start + keyEnd
-				ctx.fallback = strings.Trim(string([]rune(query)[ctx.start:ctx.end]), `"`)
-			}
-		}
-	}
-	items = rankCompletionItems(prefix, items)
-	if len(items) == 0 {
-		return queryColumnContext{}, nil, cmd, false
-	}
-	return ctx, items, cmd, true
-}
-
-// mongoShellCollectionItems produces collection picker items that rebuild
-// the shell expression with the new collection name.
-func (m Model) mongoShellCollectionItems(method string, tokens []mongoToken) []columnPickerItem {
-	if method == "" {
-		method = "find"
-	}
-	// Map internal method names to shell method names
-	shellMethod := method
-	switch method {
-	case "find":
-		shellMethod = "find"
-	case "aggregate":
-		shellMethod = "aggregate"
-	case "insert":
-		shellMethod = "insertOne"
-	case "update":
-		shellMethod = "updateOne"
-	case "delete":
-		shellMethod = "deleteOne"
-	case "count":
-		shellMethod = "countDocuments"
-	}
-	// Reconstruct the args portion from existing tokens (if any)
-	args := ""
-	if len(tokens) > 2 {
-		argParts := make([]string, 0, len(tokens)-2)
-		for _, t := range tokens[2:] {
-			argParts = append(argParts, t.value)
-		}
-		args = strings.Join(argParts, ", ")
-	}
-	if args == "" {
-		args = "{}"
-	}
-
-	items := make([]columnPickerItem, 0, len(m.tables))
-	for _, name := range m.tables {
-		items = append(items, columnPickerItem{
-			label:      name,
-			detail:     "collection",
-			insertText: fmt.Sprintf("db.%s.%s(%s)", name, shellMethod, args),
-		})
-	}
-	return items
-}
-
-func mongoCollectionFromTokens(tokens []mongoToken) string {
-	if len(tokens) < 2 {
-		return ""
-	}
-	return strings.Trim(tokens[1].value, `"'`)
-}
-
-type mongoToken struct {
-	value string
-	start int
-	end   int
-}
-
-func mongoTokens(query string) []mongoToken {
-	runes := []rune(query)
-
-	// Detect shell format: db.collection.method(args...)
-	// Convert to virtual tokens: [method, collection, arg0, arg1, ...]
-	// with positions mapping back to the original query.
-	if shellTokens, ok := mongoShellTokens(runes); ok {
-		return shellTokens
-	}
-
-	// Fallback: whitespace-separated internal format (find collection {filter} ...)
-	tokens := make([]mongoToken, 0, 8)
-	start := -1
-	depth := 0
-	inQuote := false
-	var quote rune
-	for i, r := range runes {
-		if inQuote {
-			if r == quote && (i == 0 || runes[i-1] != '\\') {
-				inQuote = false
-			}
-			continue
-		}
-		switch r {
-		case '"', '\'':
-			inQuote = true
-			quote = r
-			if start == -1 {
-				start = i
-			}
-		case '{', '[':
-			depth++
-			if start == -1 {
-				start = i
-			}
-		case '}', ']':
-			if depth > 0 {
-				depth--
-			}
-		}
-		if start == -1 {
-			if !unicode.IsSpace(r) {
-				start = i
-			}
-			continue
-		}
-		if depth == 0 && unicode.IsSpace(r) {
-			tokens = append(tokens, mongoToken{value: string(runes[start:i]), start: start, end: i})
-			start = -1
-		}
-	}
-	if start >= 0 {
-		tokens = append(tokens, mongoToken{value: string(runes[start:]), start: start, end: len(runes)})
-	}
-	return tokens
-}
-
-// mongoShellTokens parses db.collection.method(arg0, arg1, ...) into virtual tokens:
-//   token 0 = method name (e.g. "find")
-//   token 1 = collection name (e.g. "users")
-//   token 2+ = comma-separated arguments inside parens
-// Positions map back to the original query so completion insertion works correctly.
-func mongoShellTokens(runes []rune) ([]mongoToken, bool) {
-	s := string(runes)
-	if !strings.HasPrefix(s, "db.") {
-		return nil, false
-	}
-	rest := s[3:]
-	dotIdx := strings.Index(rest, ".")
-	if dotIdx < 0 {
-		// Typing "db." or "db.use" — still in collection position.
-		// token 0 = empty command placeholder, token 1 = what's after "db."
-		return []mongoToken{
-			{value: "", start: 0, end: 0},
-			{value: rest, start: 3, end: len(runes)},
-		}, true
-	}
-	collection := rest[:dotIdx]
-	afterCollection := rest[dotIdx+1:]
-
-	parenIdx := strings.Index(afterCollection, "(")
-	if parenIdx < 0 {
-		// Typing method name, e.g. "db.users.fi"
-		methodStart := 3 + dotIdx + 1
-		return []mongoToken{
-			{value: afterCollection, start: methodStart, end: len(runes)},
-			{value: collection, start: 3, end: 3 + dotIdx},
-		}, true
-	}
-	method := strings.ToLower(afterCollection[:parenIdx])
-	methodStart := 3 + dotIdx + 1
-	// The args portion starts after '(' and ends before the final ')'
-	argsStart := methodStart + parenIdx + 1 // index in runes right after '('
-	tokens := []mongoToken{
-		{value: method, start: methodStart, end: methodStart + parenIdx},
-		{value: collection, start: 3, end: 3 + dotIdx},
-	}
-
-	// Split args by top-level commas (not inside {}, [], or strings)
-	argsRunes := runes[argsStart:]
-	// Strip trailing ')' if present
-	argsEnd := len(argsRunes)
-	if argsEnd > 0 && argsRunes[argsEnd-1] == ')' {
-		argsEnd--
-	}
-	argsRunes = argsRunes[:argsEnd]
-
-	if len(argsRunes) == 0 {
-		// Empty parens: db.users.find() — add a virtual empty arg token at cursor
-		tokens = append(tokens, mongoToken{value: "", start: argsStart, end: argsStart})
-		return tokens, true
-	}
-
-	depth := 0
-	inStr := false
-	escape := false
-	argStart := 0
-	for i := 0; i < len(argsRunes); i++ {
-		ch := argsRunes[i]
-		if escape {
-			escape = false
-			continue
-		}
-		if ch == '\\' && inStr {
-			escape = true
-			continue
-		}
-		if ch == '"' {
-			inStr = !inStr
-			continue
-		}
-		if inStr {
-			continue
-		}
-		switch ch {
-		case '{', '[', '(':
-			depth++
-		case '}', ']', ')':
-			if depth > 0 {
-				depth--
-			}
-		case ',':
-			if depth == 0 {
-				argVal := strings.TrimSpace(string(argsRunes[argStart:i]))
-				tokens = append(tokens, mongoToken{
-					value: argVal,
-					start: argsStart + argStart,
-					end:   argsStart + i,
-				})
-				argStart = i + 1
-			}
-		}
-	}
-	// Last arg
-	argVal := strings.TrimSpace(string(argsRunes[argStart:]))
-	tokens = append(tokens, mongoToken{
-		value: argVal,
-		start: argsStart + argStart,
-		end:   argsStart + len(argsRunes),
-	})
-
-	return tokens, true
-}
-
-func (m Model) mongoCommandItems() []columnPickerItem {
-	return mongoCommandItemsForCollection(fallbackTableName(m.currentTableName()))
-}
-
-func mongoCommandItemsForCollection(table string) []columnPickerItem {
-	if table == "" {
-		table = "collection"
-	}
-	return []columnPickerItem{
-		{label: "find", detail: "query", insertText: fmt.Sprintf("db.%s.find({})", table)},
-		{label: "aggregate", detail: "query", insertText: fmt.Sprintf("db.%s.aggregate([])", table)},
-		{label: "insertOne", detail: "query", insertText: fmt.Sprintf("db.%s.insertOne({})", table)},
-		{label: "updateOne", detail: "query", insertText: fmt.Sprintf("db.%s.updateOne({},{\"$set\":{}})", table)},
-		{label: "updateMany", detail: "query", insertText: fmt.Sprintf("db.%s.updateMany({},{\"$set\":{}})", table)},
-		{label: "deleteOne", detail: "query", insertText: fmt.Sprintf("db.%s.deleteOne({})", table)},
-		{label: "deleteMany", detail: "query", insertText: fmt.Sprintf("db.%s.deleteMany({})", table)},
-		{label: "countDocuments", detail: "query", insertText: fmt.Sprintf("db.%s.countDocuments({})", table)},
-		{label: "collections", detail: "command", insertText: "collections"},
-	}
-}
-
-func (m Model) mongoCollectionItems() []columnPickerItem {
-	items := make([]columnPickerItem, 0, len(m.tables))
-	for _, name := range m.tables {
-		items = append(items, columnPickerItem{label: name, detail: "collection", insertText: name})
-	}
-	return items
-}
-
-func (m Model) mongoArgumentItems(command, collection string, tokenIdx int, token string, tokenCursor int) ([]columnPickerItem, tea.Cmd) {
-	schemaFields, schemaTypes, schemaCmd := m.mongoSchemaFields(collection)
-	filterField := fallbackColumnName(preferredFilterColumnFromFields(schemaFields))
-	groupField := fallbackColumnName(preferredCategoricalColumnFromFields(schemaFields, schemaTypes))
-
-	filterItems := func() []columnPickerItem {
-		items := []columnPickerItem{{label: "empty filter", detail: "json", insertText: "{}"}}
-		items = append(items, mongoJSONTopLevelOperatorItems()...)
-		if len(schemaFields) == 0 {
-			items = append(items, columnPickerItem{label: "field filter", detail: "json", insertText: fmt.Sprintf(`{"%s":%s}`, filterField, mongoPlaceholderForType(""))})
-			return items
-		}
-		for _, field := range schemaFields {
-			items = append(items, columnPickerItem{
-				label:      field,
-				detail:     "field",
-				insertText: fmt.Sprintf(`{"%s":%s}`, field, mongoPlaceholderForType(schemaTypes[field])),
-			})
-		}
-		return items
-	}
-	sortItems := func() []columnPickerItem {
-		if len(schemaFields) == 0 {
-			return []columnPickerItem{
-				{label: "recent sort", detail: "json", insertText: fmt.Sprintf(`{"%s":-1}`, groupField)},
-				{label: "ascending sort", detail: "json", insertText: fmt.Sprintf(`{"%s":1}`, filterField)},
-			}
-		}
-		items := make([]columnPickerItem, 0, len(schemaFields)*2)
-		for _, field := range schemaFields {
-			items = append(items,
-				columnPickerItem{label: field + " desc", detail: "sort", insertText: fmt.Sprintf(`{"%s":-1}`, field)},
-				columnPickerItem{label: field + " asc", detail: "sort", insertText: fmt.Sprintf(`{"%s":1}`, field)},
-			)
-		}
-		return items
-	}
-
-	trimmedToken := strings.TrimSpace(token)
-	if strings.HasPrefix(trimmedToken, "{") && len(trimmedToken) > 1 {
-		if valueItems, valueCmd, ok := m.mongoJSONValueItems(collection, token, tokenCursor); ok {
-			return valueItems, valueCmd
-		}
-		if keyItems, ok := m.mongoJSONObjectItems(command, schemaFields, schemaTypes, token, tokenCursor); ok {
-			// If we have no schema fields yet but a load is pending, show a hint
-			// at the top so the user knows fields are on their way.
-			if len(schemaFields) == 0 && schemaCmd != nil {
-				hint := columnPickerItem{label: "loading fields…", detail: collection, insertText: ""}
-				keyItems = append([]columnPickerItem{hint}, keyItems...)
-			}
-			return keyItems, schemaCmd
-		}
-	}
-
-	switch command {
-	case "find":
-		if tokenIdx == 2 {
-			return filterItems(), schemaCmd
-		}
-		if tokenIdx == 3 {
-			if strings.HasPrefix(strings.TrimSpace(token), "{") {
-				return sortItems(), schemaCmd
-			}
-			return []columnPickerItem{
-				{label: "limit 20", detail: "limit", insertText: "20"},
-				{label: "limit 50", detail: "limit", insertText: "50"},
-				{label: "limit 100", detail: "limit", insertText: "100"},
-			}, nil
-		}
-		return sortItems(), schemaCmd
-	case "aggregate":
-		return []columnPickerItem{
-			{label: "match + limit", detail: "pipeline", insertText: fmt.Sprintf(`[{"$match":{"%s":%s}},{"$limit":20}]`, filterField, mongoPlaceholderForType(schemaTypes[filterField]))},
-			{label: "group + count", detail: "pipeline", insertText: fmt.Sprintf(`[{"$group":{"_id":"$%s","count":{"$sum":1}}},{"$sort":{"count":-1}},{"$limit":20}]`, groupField)},
-		}, nil
-	case "insert":
-		return []columnPickerItem{
-			{label: "document", detail: "json", insertText: fmt.Sprintf(`{"%s":%s}`, filterField, mongoPlaceholderForType(schemaTypes[filterField]))},
-		}, nil
-	case "update":
-		if tokenIdx == 2 {
-			return filterItems(), schemaCmd
-		}
-		if tokenIdx == 3 {
-			return []columnPickerItem{
-				{label: "$set", detail: "json", insertText: fmt.Sprintf(`{"$set":{"%s":%s}}`, filterField, mongoPlaceholderForType(schemaTypes[filterField]))},
-			}, nil
-		}
-		return []columnPickerItem{
-			{label: "many", detail: "token", insertText: "many"},
-		}, nil
-	case "delete":
-		if tokenIdx == 2 {
-			return filterItems(), schemaCmd
-		}
-		return []columnPickerItem{
-			{label: "many", detail: "token", insertText: "many"},
-		}, nil
-	case "count":
-		return filterItems(), schemaCmd
-	default:
-		return nil, schemaCmd
-	}
-}
-
-func (m Model) mongoSchemaFields(collection string) ([]string, map[string]string, tea.Cmd) {
-	types := map[string]string{}
-	if collection == "" {
-		fields, fieldTypes := m.currentSchemaFieldNames()
-		return fields, fieldTypes, nil
-	}
-	if m.tableSchema != nil && strings.EqualFold(m.tableSchema.Name, collection) {
-		fields, fieldTypes := m.currentSchemaFieldNames()
-		return fields, fieldTypes, nil
-	}
-	if cached := m.schemaCache[schemaCacheKey(m.activeConnIdx, collection)]; cached != nil {
-		fields := make([]string, 0, len(cached.Columns))
-		for _, col := range cached.Columns {
-			fields = append(fields, col.Name)
-			types[col.Name] = strings.ToLower(col.Type)
-		}
-		return fields, types, nil
-	}
-	return nil, types, m.loadSchemaForCache(collection)
-}
-
-func (m Model) currentSchemaFieldNames() ([]string, map[string]string) {
-	if m.tableSchema == nil || len(m.tableSchema.Columns) == 0 {
-		return nil, map[string]string{}
-	}
-	fields := make([]string, 0, len(m.tableSchema.Columns))
-	types := make(map[string]string, len(m.tableSchema.Columns))
-	for _, col := range m.tableSchema.Columns {
-		fields = append(fields, col.Name)
-		types[col.Name] = strings.ToLower(col.Type)
-	}
-	return fields, types
-}
-
-func mongoJSONFieldItems(fields []string, fieldTypes map[string]string, token string, cursor int) ([]columnPickerItem, bool) {
-	if len(fields) == 0 {
-		return nil, false
-	}
-	if !mongoLooksLikeFieldKeyContext(token, cursor) {
-		return nil, false
-	}
-	items := make([]columnPickerItem, 0, len(fields))
-	for _, field := range fields {
-		items = append(items, columnPickerItem{
-			label:      field,
-			detail:     "field",
-			insertText: fmt.Sprintf(`"%s":%s`, field, mongoPlaceholderForType(fieldTypes[field])),
-		})
-	}
-	return items, true
-}
-
-func (m Model) mongoJSONObjectItems(command string, fields []string, fieldTypes map[string]string, token string, cursor int) ([]columnPickerItem, bool) {
-	if items, ok := mongoJSONUpdateFieldItems(fields, fieldTypes, token, cursor); ok {
-		return items, true
-	}
-	if field, ok := mongoJSONComparisonFieldContext(token, cursor); ok {
-		return mongoJSONComparisonOperatorItems(field, fieldTypes[field], token, cursor), true
-	}
-	if !mongoLooksLikeFieldKeyContext(token, cursor) {
-		return nil, false
-	}
-	items, _ := mongoJSONFieldItems(fields, fieldTypes, token, cursor)
-	switch command {
-	case "update":
-		items = append(mongoJSONUpdateOperatorItems(), items...)
-	default:
-		items = append(items, mongoJSONTopLevelOperatorItems()...)
-	}
-	return items, len(items) > 0
-}
-
-func mongoJSONTopLevelOperatorItems() []columnPickerItem {
-	return []columnPickerItem{
-		{label: "$or", detail: "operator", insertText: `"$or":[{}]`},
-		{label: "$and", detail: "operator", insertText: `"$and":[{}]`},
-		{label: "$nor", detail: "operator", insertText: `"$nor":[{}]`},
-		{label: "$expr", detail: "operator", insertText: `"$expr":{}`},
-	}
-}
-
-func mongoJSONUpdateOperatorItems() []columnPickerItem {
-	return []columnPickerItem{
-		{label: "$set", detail: "operator", insertText: `"$set":{}`},
-		{label: "$unset", detail: "operator", insertText: `"$unset":{"field":""}`},
-		{label: "$inc", detail: "operator", insertText: `"$inc":{"field":1}`},
-		{label: "$push", detail: "operator", insertText: `"$push":{"field":""}`},
-		{label: "$pull", detail: "operator", insertText: `"$pull":{"field":""}`},
-		{label: "$addToSet", detail: "operator", insertText: `"$addToSet":{"field":""}`},
-	}
-}
-
-func mongoJSONComparisonOperatorItems(field, fieldType, token string, cursor int) []columnPickerItem {
-	_, _, rawValue, preserveValue := mongoJSONOperatorPairBounds(token, cursor)
-	operatorInsert := func(op, fallback string) string {
-		if preserveValue {
-			return fmt.Sprintf(`"%s":%s`, op, mongoTransformOperatorValue(op, rawValue, fieldType))
-		}
-		return fallback
-	}
-	value := mongoPlaceholderForType(fieldType)
-	items := []columnPickerItem{
-		{label: "$eq", detail: "operator", insertText: operatorInsert(`$eq`, fmt.Sprintf(`"$eq":%s`, value))},
-		{label: "$ne", detail: "operator", insertText: operatorInsert(`$ne`, fmt.Sprintf(`"$ne":%s`, value))},
-		{label: "$exists", detail: "operator", insertText: operatorInsert(`$exists`, `"$exists":true`)},
-	}
-	switch strings.ToLower(fieldType) {
-	case "int", "uint", "float", "decimal", "number", "date", "datetime", "timestamp":
-		items = append(items,
-			columnPickerItem{label: "$gt", detail: "operator", insertText: operatorInsert(`$gt`, fmt.Sprintf(`"$gt":%s`, value))},
-			columnPickerItem{label: "$gte", detail: "operator", insertText: operatorInsert(`$gte`, fmt.Sprintf(`"$gte":%s`, value))},
-			columnPickerItem{label: "$lt", detail: "operator", insertText: operatorInsert(`$lt`, fmt.Sprintf(`"$lt":%s`, value))},
-			columnPickerItem{label: "$lte", detail: "operator", insertText: operatorInsert(`$lte`, fmt.Sprintf(`"$lte":%s`, value))},
-			columnPickerItem{label: "$in", detail: "operator", insertText: operatorInsert(`$in`, fmt.Sprintf(`"$in":[%s]`, value))},
-			columnPickerItem{label: "$nin", detail: "operator", insertText: operatorInsert(`$nin`, fmt.Sprintf(`"$nin":[%s]`, value))},
-		)
-	case "string":
-		items = append(items,
-			columnPickerItem{label: "$regex", detail: "operator", insertText: operatorInsert(`$regex`, `"$regex":""`)},
-			columnPickerItem{label: "$in", detail: "operator", insertText: operatorInsert(`$in`, `"$in":[""]`)},
-		)
-	}
-	return items
-}
-
-func mongoJSONComparisonFieldContext(token string, cursor int) (string, bool) {
-	runes := []rune(token)
-	if cursor < 0 {
-		cursor = 0
-	}
-	if cursor > len(runes) {
-		cursor = len(runes)
-	}
-	before := string(runes[:cursor])
-	match := regexp.MustCompile(`(?s)"([^"]+)"\s*:\s*\{\s*(?:"\$?[A-Za-z_]*)?$`).FindStringSubmatch(before)
-	if len(match) != 2 {
-		return "", false
-	}
-	if strings.HasPrefix(match[1], "$") {
-		return "", false
-	}
-	return match[1], true
-}
-
-func mongoJSONOperatorBounds(token string, cursor int) (int, int, bool) {
-	runes := []rune(token)
-	if cursor < 0 {
-		cursor = 0
-	}
-	if cursor > len(runes) {
-		cursor = len(runes)
-	}
-	start := cursor
-	for start > 0 {
-		if runes[start-1] == '"' {
-			break
-		}
-		if !(unicode.IsLetter(runes[start-1]) || runes[start-1] == '$' || runes[start-1] == '_') {
-			return 0, 0, false
-		}
-		start--
-	}
-	if start >= len(runes) || runes[start] != '$' {
-		if start+1 >= len(runes) || runes[start] != '"' || runes[start+1] != '$' {
-			return 0, 0, false
-		}
-		start++
-	}
-	end := start
-	for end < len(runes) && (unicode.IsLetter(runes[end]) || runes[end] == '$' || runes[end] == '_') {
-		end++
-	}
-	if start == end {
-		return 0, 0, false
-	}
-	return start - 1, min(len(runes), end+1), true
-}
-
-func mongoJSONOperatorPairBounds(token string, cursor int) (int, int, string, bool) {
-	runes := []rune(token)
-	start, end, ok := mongoJSONOperatorBounds(token, cursor)
-	if !ok {
-		return 0, 0, "", false
-	}
-	if end > len(runes) {
-		end = len(runes)
-	}
-	i := end
-	for i < len(runes) && unicode.IsSpace(runes[i]) {
-		i++
-	}
-	if i >= len(runes) || runes[i] != ':' {
-		return 0, 0, "", false
-	}
-	i++
-	for i < len(runes) && unicode.IsSpace(runes[i]) {
-		i++
-	}
-	if i >= len(runes) {
-		return start, end, "", false
-	}
-	valueStart := i
-	valueEnd := mongoJSONLiteralEnd(runes, valueStart)
-	raw := strings.TrimSpace(string(runes[valueStart:valueEnd]))
-	return start, valueEnd, raw, raw != ""
-}
-
-func mongoTransformOperatorValue(op, rawValue, fieldType string) string {
-	raw := strings.TrimSpace(rawValue)
-	if raw == "" {
-		switch op {
-		case "$exists":
-			return "true"
-		case "$in", "$nin":
-			value := mongoPlaceholderForType(fieldType)
-			return "[" + value + "]"
-		default:
-			return mongoPlaceholderForType(fieldType)
-		}
-	}
-	switch op {
-	case "$exists":
-		if strings.EqualFold(raw, "true") || strings.EqualFold(raw, "false") {
-			return strings.ToLower(raw)
-		}
-		return "true"
-	case "$in", "$nin":
-		if strings.HasPrefix(raw, "[") {
-			return raw
-		}
-		return "[" + raw + "]"
-	default:
-		return raw
-	}
-}
-
-func mongoJSONUpdateFieldItems(fields []string, fieldTypes map[string]string, token string, cursor int) ([]columnPickerItem, bool) {
-	runes := []rune(token)
-	if cursor < 0 {
-		cursor = 0
-	}
-	if cursor > len(runes) {
-		cursor = len(runes)
-	}
-	before := string(runes[:cursor])
-	if !regexp.MustCompile(`(?s)"\$(?:set|unset|inc|push|pull|addToSet)"\s*:\s*\{\s*(?:"[^"]*)?$`).MatchString(before) {
-		return nil, false
-	}
-	return mongoJSONFieldItems(fields, fieldTypes, token, cursor)
-}
-
-func mongoLooksLikeFieldKeyContext(token string, cursor int) bool {
-	runes := []rune(token)
-	if cursor < 0 {
-		cursor = 0
-	}
-	if cursor > len(runes) {
-		cursor = len(runes)
-	}
-	segment := strings.TrimSpace(string(runes[:cursor]))
-	if segment == "" {
-		return false
-	}
-	segment = strings.TrimRight(segment, " \t")
-	if strings.HasSuffix(segment, "{") || strings.HasSuffix(segment, ",") || strings.HasSuffix(segment, `"`) {
-		return true
-	}
-	if regexp.MustCompile(`(?s)[{,]\s*"[^"]*$`).MatchString(segment) {
-		return true
-	}
-	return false
-}
-
-func mongoJSONKeyBounds(token string, cursor int) (int, int, bool) {
-	runes := []rune(token)
-	if cursor < 0 {
-		cursor = 0
-	}
-	if cursor > len(runes) {
-		cursor = len(runes)
-	}
-	before := string(runes[:cursor])
-	idxs := regexp.MustCompile(`(?s)(^|[{,]\s*)("?[A-Za-z0-9_$]*)$`).FindStringSubmatchIndex(before)
-	if len(idxs) != 6 {
-		return 0, 0, false
-	}
-	start := idxs[4]
-	end := cursor
-	for end < len(runes) {
-		r := runes[end]
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '$' {
-			end++
-			continue
-		}
-		if r == '"' {
-			end++
-		}
-		break
-	}
-	return start, end, true
-}
-
-func (m Model) mongoJSONValueItems(collection, token string, cursor int) ([]columnPickerItem, tea.Cmd, bool) {
-	if _, ok := mongoJSONComparisonFieldContext(token, cursor); ok {
-		return nil, nil, false
-	}
-	col, prefix, ok := mongoFieldAndValuePrefix(token, cursor)
-	if !ok || col == "" || strings.HasPrefix(col, "$") || strings.HasPrefix(strings.TrimSpace(prefix), "$") {
-		return nil, nil, false
-	}
-	if collection == "" {
-		return nil, nil, false
-	}
-	fieldType := m.mongoFieldType(collection, col)
-	key := columnValueKey(m.activeConnIdx, collection, col)
-	values, cached := m.columnValueCache[key]
-	var cmd tea.Cmd
-	if !cached {
-		cmd = m.loadColumnValues(collection, col)
-	}
-
-	literals := mongoLiteralCandidates(fieldType)
-	items := make([]columnPickerItem, 0, len(values)+len(literals)+1)
-	for _, literal := range literals {
-		items = append(items, columnPickerItem{
-			label:      literal,
-			detail:     col,
-			insertText: literal,
-		})
-	}
-	for _, v := range values {
-		items = append(items, columnPickerItem{
-			label:      v,
-			detail:     col,
-			insertText: mongoTypedJSONLiteral(fieldType, v),
-		})
-	}
-	items = rankCompletionItems(strings.ToLower(prefix), items)
-	if !cached && len(items) == 0 {
-		items = append(items, columnPickerItem{label: "loading…", detail: "fetching samples", insertText: token})
-	}
-	if len(items) == 0 {
-		items = append(items, columnPickerItem{label: "(no samples)", detail: col, insertText: token})
-	}
-	return items, cmd, true
-}
-
-func (m Model) mongoFieldType(collection, field string) string {
-	if field == "" {
-		return ""
-	}
-	if m.tableSchema != nil && strings.EqualFold(m.tableSchema.Name, collection) {
-		for _, col := range m.tableSchema.Columns {
-			if strings.EqualFold(col.Name, field) {
-				return strings.ToLower(col.Type)
-			}
-		}
-	}
-	if cached := m.schemaCache[schemaCacheKey(m.activeConnIdx, collection)]; cached != nil {
-		for _, col := range cached.Columns {
-			if strings.EqualFold(col.Name, field) {
-				return strings.ToLower(col.Type)
-			}
-		}
-	}
-	return ""
-}
-
-func mongoPlaceholderForType(fieldType string) string {
-	switch strings.ToLower(fieldType) {
-	case "objectid":
-		return `{"$oid":"000000000000000000000000"}`
-	case "date", "datetime", "timestamp":
-		return `{"$date":"2026-01-01T00:00:00Z"}`
-	case "array":
-		return "[]"
-	case "object", "document", "map", "mixed":
-		return "{}"
-	case "bool", "boolean", "int", "uint", "float", "decimal", "number", "null":
-		return "null"
-	default:
-		return `""`
-	}
-}
-
-func mongoTypedJSONLiteral(fieldType, raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	kind := strings.ToLower(fieldType)
-
-	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
-		if json.Valid([]byte(trimmed)) {
-			return trimmed
-		}
-	}
-
-	switch kind {
-	case "objectid":
-		if looksLikeObjectIDHex(trimmed) {
-			return fmt.Sprintf(`{"$oid":"%s"}`, trimmed)
-		}
-	case "date", "datetime", "timestamp":
-		if t, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
-			return fmt.Sprintf(`{"$date":"%s"}`, t.UTC().Format(time.RFC3339Nano))
-		}
-		if t, err := time.Parse(time.RFC3339, trimmed); err == nil {
-			return fmt.Sprintf(`{"$date":"%s"}`, t.UTC().Format(time.RFC3339))
-		}
-	case "array":
-		if strings.HasPrefix(trimmed, "[") && json.Valid([]byte(trimmed)) {
-			return trimmed
-		}
-	case "object", "document", "map":
-		if strings.HasPrefix(trimmed, "{") && json.Valid([]byte(trimmed)) {
-			return trimmed
-		}
-	}
-
-	switch strings.ToLower(fieldType) {
-	case "bool", "boolean":
-		if strings.EqualFold(trimmed, "true") {
-			return "true"
-		}
-		if strings.EqualFold(trimmed, "false") {
-			return "false"
-		}
-	case "int", "uint", "float", "decimal", "number":
-		if _, err := strconv.ParseFloat(trimmed, 64); err == nil {
-			return trimmed
-		}
-	case "null":
-		if strings.EqualFold(trimmed, "null") || strings.EqualFold(trimmed, "NULL") {
-			return "null"
-		}
-	}
-	if strings.EqualFold(trimmed, "null") || strings.EqualFold(trimmed, "NULL") {
-		return "null"
-	}
-	return strconv.Quote(raw)
-}
-
-func looksLikeObjectIDHex(s string) bool {
-	if len(s) != 24 {
-		return false
-	}
-	for _, r := range s {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
-			return false
-		}
-	}
-	return true
-}
-
-func mongoLiteralCandidates(fieldType string) []string {
-	switch strings.ToLower(fieldType) {
-	case "bool", "boolean":
-		return []string{"true", "false", "null"}
-	case "int", "uint", "float", "decimal", "number":
-		return []string{"0", "1", "-1", "3.14", "null"}
-	case "objectid":
-		return []string{`{"$oid":"000000000000000000000000"}`, "null"}
-	case "date", "datetime", "timestamp":
-		return []string{`{"$date":"2026-01-01T00:00:00Z"}`, "null"}
-	case "array":
-		return []string{"[]", "[1,2,3]", "null"}
-	case "object", "document", "map":
-		return []string{"{}", `{"key":"value"}`, "null"}
-	case "mixed":
-		return []string{"true", "false", "0", "null", "{}", "[]"}
-	default:
-		return []string{"null"}
-	}
-}
-
-func mongoFieldAndValuePrefix(token string, cursor int) (field string, valuePrefix string, ok bool) {
-	runes := []rune(token)
-	if cursor < 0 {
-		cursor = 0
-	}
-	if cursor > len(runes) {
-		cursor = len(runes)
-	}
-	before := string(runes[:cursor])
-	quoted := regexp.MustCompile(`"([^"]+)"\s*:\s*"([^"]*)$`).FindStringSubmatch(before)
-	if len(quoted) == 3 {
-		return quoted[1], quoted[2], true
-	}
-	bare := regexp.MustCompile(`"([^"]+)"\s*:\s*([^,\}\]\s]*)$`).FindStringSubmatch(before)
-	if len(bare) == 3 {
-		return bare[1], strings.TrimSpace(strings.TrimPrefix(bare[2], `"`)), true
-	}
-	return "", "", false
-}
-
-func mongoJSONValueBounds(token string, cursor int) (int, int, bool) {
-	runes := []rune(token)
-	if cursor < 0 {
-		cursor = 0
-	}
-	if cursor > len(runes) {
-		cursor = len(runes)
-	}
-	before := string(runes[:cursor])
-	if idxs := regexp.MustCompile(`"([^"]+)"\s*:\s*"([^"]*)$`).FindStringSubmatchIndex(before); len(idxs) == 6 {
-		contentStart := idxs[4]
-		start := contentStart - 1
-		end := cursor
-		for end < len(runes) {
-			if runes[end] == '"' && (end == 0 || runes[end-1] != '\\') {
-				end++
-				break
-			}
-			end++
-		}
-		return start, end, true
-	}
-	if idxs := regexp.MustCompile(`"([^"]+)"\s*:\s*([^,\}\]\s]*)$`).FindStringSubmatchIndex(before); len(idxs) == 6 {
-		start := idxs[4]
-		end := cursor
-		for end < len(runes) && !strings.ContainsRune(",}]", runes[end]) && !unicode.IsSpace(runes[end]) {
-			end++
-		}
-		return start, end, true
-	}
-	return 0, 0, false
-}
-
-func mongoJSONLiteralEnd(runes []rune, start int) int {
-	if start >= len(runes) {
-		return start
-	}
-	if runes[start] == '"' {
-		end := start + 1
-		for end < len(runes) {
-			if runes[end] == '"' && runes[end-1] != '\\' {
-				return end + 1
-			}
-			end++
-		}
-		return len(runes)
-	}
-	depthBrace := 0
-	depthBracket := 0
-	inQuote := false
-	for end := start; end < len(runes); end++ {
-		r := runes[end]
-		if inQuote {
-			if r == '"' && runes[end-1] != '\\' {
-				inQuote = false
-			}
-			continue
-		}
-		switch r {
-		case '"':
-			inQuote = true
-		case '{':
-			depthBrace++
-		case '}':
-			if depthBrace == 0 && depthBracket == 0 {
-				return end
-			}
-			if depthBrace > 0 {
-				depthBrace--
-			}
-		case '[':
-			depthBracket++
-		case ']':
-			if depthBracket > 0 {
-				depthBracket--
-			}
-		case ',':
-			if depthBrace == 0 && depthBracket == 0 {
-				return end
-			}
-		}
-	}
-	return len(runes)
-}
-
-func mongoCompletionPrefix(token string) string {
-	token = strings.TrimSpace(token)
-	if token == "" {
-		return ""
-	}
-	if idx := strings.LastIndex(token, `"`); idx >= 0 && idx+1 <= len(token) {
-		return strings.ToLower(strings.TrimSpace(token[idx+1:]))
-	}
-	return strings.ToLower(strings.Trim(token, `"'`))
-}
-
-func (m Model) columnPickerCandidates(ctx queryColumnContext) []columnPickerItem {
-	prefix := strings.ToLower(currentTokenValue([]rune(m.queryInput.Value())[ctx.start:ctx.end]))
-	aliasPrefix := m.currentAliasPrefix(ctx)
-
-	// Prefer schema for the query-inferred table; fall back to result columns.
-	// Don't use schema from a different table — return empty so "loading…" shows instead.
-	var colNames []struct{ name, typ string }
-	inferred := m.queryInferredTable()
-	if m.tableSchema != nil && (inferred == "" || strings.EqualFold(m.tableSchema.Name, inferred)) {
-		for _, col := range m.tableSchema.Columns {
-			colNames = append(colNames, struct{ name, typ string }{col.Name, col.Type})
-		}
-	} else if inferred != "" {
-		if cached := m.schemaCache[schemaCacheKey(m.activeConnIdx, inferred)]; cached != nil {
-			for _, col := range cached.Columns {
-				colNames = append(colNames, struct{ name, typ string }{col.Name, col.Type})
-			}
-		}
-	} else if m.tableSchema == nil {
-		if m.queryResult != nil {
-			for _, col := range m.queryResult.Columns {
-				colNames = append(colNames, struct{ name, typ string }{col, ""})
-			}
-		}
-	}
-
-	items := make([]columnPickerItem, 0, len(colNames)+1)
-	// Only offer '*' when we have actual column info; a lone '*' with no schema
-	// isn't useful on its own.
-	if ctx.includeStar && len(colNames) > 0 {
-		items = append(items, columnPickerItem{label: "*", detail: "all", insertText: "*"})
-	}
-	for _, col := range colNames {
-		items = append(items, columnPickerItem{
-			label:      col.name,
-			detail:     col.typ,
-			insertText: m.columnInsertionValue(col.name, aliasPrefix),
-		})
-	}
-	return rankCompletionItems(prefixWithoutAlias(prefix), items)
-}
-
 func (m Model) queryCursorIndex() int {
 	query := []rune(m.queryInput.Value())
-	line := clampInt(m.queryInput.Line(), 0, len(splitQueryLines(query))-1)
+	line := clampInt(m.queryInput.Line(), 0, len(completion.SplitLines(query))-1)
 	col := m.queryInput.LineInfo().ColumnOffset
-	return queryIndexForLineCol(query, line, col)
+	return completion.IndexForLineCol(query, line, col)
 }
 
-func (m *Model) applyCompletionInsertion(ctx queryColumnContext, items []columnPickerItem) {
-	if len(items) == 0 && ctx.fallback != "" {
-		items = []columnPickerItem{{insertText: ctx.fallback}}
+func (m *Model) applyCompletionInsertion(start, end int, fallback string, multi bool, items []completion.Item) {
+	if len(items) == 0 && fallback != "" {
+		items = []completion.Item{{InsertText: fallback}}
 	}
 	if len(items) == 0 {
 		return
 	}
 	parts := make([]string, 0, len(items))
 	for _, item := range items {
-		insertText := item.insertText
+		insertText := item.InsertText
 		if insertText == "" {
-			insertText = item.label
+			insertText = item.Label
 		}
 		parts = append(parts, insertText)
 	}
 	insert := strings.Join(parts, ", ")
-	if !ctx.multi && len(parts) == 1 {
+	if !multi && len(parts) == 1 {
 		insert = parts[0]
 	}
 	query := []rune(m.queryInput.Value())
-	if ctx.start < 0 || ctx.start > len(query) {
-		ctx.start = len(query)
+	if start < 0 || start > len(query) {
+		start = len(query)
 	}
-	if ctx.end < ctx.start || ctx.end > len(query) {
-		ctx.end = ctx.start
-	}
-	// Only append filterSuffix when no operator already follows the insertion
-	// point, so contextual insertion doesn't duplicate an existing predicate.
-	if ctx.filterSuffix != "" && !ctx.multi && len(parts) == 1 {
-		queryAfter := strings.TrimLeft(string(query[ctx.end:]), " \t\n")
-		if len(queryAfter) == 0 || !strings.ContainsAny(string(queryAfter[0]), "=!<>") {
-			insert += ctx.filterSuffix
-		}
+	if end < start || end > len(query) {
+		end = start
 	}
 
 	insertRunes := []rune(insert)
-
-	updated := string(query[:ctx.start]) + insert + string(query[ctx.end:])
+	updated := string(query[:start]) + insert + string(query[end:])
 	m.queryInput.SetValue(updated)
 	m.queryInput.Focus()
 
-	endPos := ctx.start + len(insertRunes)
-	line, col := queryLineColForIndex([]rune(updated), endPos)
+	endPos := start + len(insertRunes)
+	line, col := completion.LineColForIndex([]rune(updated), endPos)
 	setTextareaCursor(&m.queryInput, line, col)
 	m.queryFocus = true
 	m.focus = panelRight
 	m.syncTableFocus()
 }
 
-func (m Model) columnInsertionValue(name, aliasPrefix string) string {
-	if name == "*" {
-		return name
-	}
-	if m.activeDB != nil && m.activeDB.Type() == "mongo" {
-		if aliasPrefix != "" {
-			return aliasPrefix + name
-		}
-		return name
-	}
-	value := fmt.Sprintf("%q", name)
-	if aliasPrefix != "" {
-		return aliasPrefix + value
-	}
-	return value
-}
-
-func queryTokenBounds(query []rune, cursor int) (int, int) {
-	if cursor < 0 {
-		cursor = 0
-	}
-	if cursor > len(query) {
-		cursor = len(query)
-	}
-	start := cursor
-	for start > 0 && isQueryTokenRune(query[start-1]) {
-		start--
-	}
-	end := cursor
-	for end < len(query) && isQueryTokenRune(query[end]) {
-		end++
-	}
-	return start, end
-}
-
-func isQueryTokenRune(r rune) bool {
-	return r == '_' || r == '"' || r == '.' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
-}
-
-func currentTokenValue(token []rune) string {
-	return strings.Trim(strings.TrimSpace(string(token)), `"`)
-}
-
-func splitQueryLines(query []rune) [][]rune {
-	lines := strings.Split(string(query), "\n")
-	out := make([][]rune, 0, len(lines))
-	for _, line := range lines {
-		out = append(out, []rune(line))
-	}
-	if len(out) == 0 {
-		return [][]rune{{}}
-	}
-	return out
-}
-
-func queryIndexForLineCol(query []rune, line, col int) int {
-	lines := splitQueryLines(query)
-	if line < 0 {
-		line = 0
-	}
-	if line >= len(lines) {
-		line = len(lines) - 1
-	}
-	idx := 0
-	for i := 0; i < line; i++ {
-		idx += len(lines[i]) + 1
-	}
-	if col < 0 {
-		col = 0
-	}
-	if col > len(lines[line]) {
-		col = len(lines[line])
-	}
-	return idx + col
-}
-
-func queryLineColForIndex(query []rune, idx int) (int, int) {
-	if idx < 0 {
-		idx = 0
-	}
-	if idx > len(query) {
-		idx = len(query)
-	}
-	line := 0
-	col := 0
-	for i := 0; i < idx; i++ {
-		if query[i] == '\n' {
-			line++
-			col = 0
-			continue
-		}
-		col++
-	}
-	return line, col
-}
-
-func prefixWithoutAlias(prefix string) string {
-	if idx := strings.LastIndex(prefix, "."); idx >= 0 {
-		return prefix[idx+1:]
-	}
-	return prefix
-}
-
-func rankCompletionItems(prefix string, items []columnPickerItem) []columnPickerItem {
-	if len(items) == 0 {
-		return nil
-	}
-	if prefix == "" {
-		return append([]columnPickerItem(nil), items...)
-	}
-	type ranked struct {
-		item  columnPickerItem
-		score int
-	}
-	rankedItems := make([]ranked, 0, len(items))
-	for _, item := range items {
-		label := strings.ToLower(item.label)
-		insert := strings.ToLower(item.insertText)
-		score := -1
-		switch {
-		case strings.HasPrefix(label, prefix), strings.HasPrefix(insert, prefix):
-			score = 0
-		case strings.Contains(label, prefix), strings.Contains(insert, prefix):
-			score = 1
-		case fuzzyMatch(label, prefix), fuzzyMatch(insert, prefix):
-			score = 2
-		}
-		if score >= 0 {
-			rankedItems = append(rankedItems, ranked{item: item, score: score})
-		}
-	}
-	if len(rankedItems) == 0 {
-		return rankCompletionItems("", items)
-	}
-	sort.SliceStable(rankedItems, func(i, j int) bool {
-		if rankedItems[i].score != rankedItems[j].score {
-			return rankedItems[i].score < rankedItems[j].score
-		}
-		return strings.ToLower(rankedItems[i].item.label) < strings.ToLower(rankedItems[j].item.label)
-	})
-	out := make([]columnPickerItem, 0, len(rankedItems))
-	for _, item := range rankedItems {
-		out = append(out, item.item)
-	}
-	return out
-}
-
-func fuzzyMatch(candidate, query string) bool {
-	if query == "" {
-		return true
-	}
-	pos := 0
-	for _, r := range candidate {
-		if pos < len(query) && rune(query[pos]) == r {
-			pos++
-		}
-	}
-	return pos == len(query)
-}
-
-func quoteIdentifierForDB(active db.DB, name string) string {
-	if active != nil && active.Type() == "mongo" {
-		return name
-	}
-	return fmt.Sprintf("%q", name)
-}
 
 func setTextareaCursor(input *textarea.Model, line, col int) {
 	input.CursorStart()
@@ -4311,213 +2621,6 @@ func setTextareaCursor(input *textarea.Model, line, col int) {
 		input.CursorDown()
 	}
 	input.SetCursor(col)
-}
-
-func lastKeyword(before, keyword string) int {
-	return strings.LastIndex(strings.ToLower(before), keyword)
-}
-
-func inSelectList(before string) bool {
-	selectIdx := lastKeyword(before, "select")
-	if selectIdx < 0 {
-		return false
-	}
-	afterSelect := before[selectIdx:]
-	for _, blocker := range []string{" from ", " where ", " group by ", " order by ", " limit ", ";"} {
-		if idx := strings.LastIndex(afterSelect, blocker); idx >= 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func inWhereClause(before string) bool {
-	lastWhere := max(lastKeyword(before, " where "), lastKeyword(before, "where "))
-	lastAnd := lastKeyword(before, " and ")
-	lastOr := lastKeyword(before, " or ")
-	lastOn := lastKeyword(before, " on ")
-	start := max(max(lastWhere, lastAnd), max(lastOr, lastOn))
-	if start < 0 {
-		return false
-	}
-	for _, blocker := range []string{" = ", " != ", " > ", " < ", " like ", " in ", " is ", "\n"} {
-		if idx := strings.LastIndex(before, blocker); idx > start {
-			return false
-		}
-	}
-	return true
-}
-
-func inOrderByList(before string) bool {
-	orderIdx := lastKeyword(before, " order by ")
-	if orderIdx < 0 {
-		return false
-	}
-	after := before[orderIdx:]
-	for _, blocker := range []string{" limit ", " where ", ";"} {
-		if idx := strings.LastIndex(after, blocker); idx >= 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func inLimitValue(before string) bool {
-	limitIdx := lastKeyword(before, " limit ")
-	if limitIdx < 0 {
-		return false
-	}
-	after := before[limitIdx+len(" limit "):]
-	for _, blocker := range []string{";", "\n"} {
-		if strings.Contains(after, blocker) {
-			return false
-		}
-	}
-	return true
-}
-
-func orderByWantsDirection(before string) bool {
-	orderIdx := lastKeyword(before, " order by ")
-	if orderIdx < 0 {
-		return false
-	}
-	after := strings.TrimSpace(before[orderIdx+len(" order by "):])
-	if after == "" {
-		return false
-	}
-	after = strings.TrimRight(after, " \t")
-	if strings.HasSuffix(after, ",") {
-		return false
-	}
-	parts := strings.Fields(strings.ReplaceAll(after, ",", " "))
-	if len(parts) == 0 {
-		return false
-	}
-	last := strings.ToLower(parts[len(parts)-1])
-	switch last {
-	case "asc", "desc", "nulls", "first", "last":
-		return false
-	default:
-		return true
-	}
-}
-
-func inGroupByList(before string) bool {
-	groupIdx := lastKeyword(before, " group by ")
-	if groupIdx < 0 {
-		return false
-	}
-	after := before[groupIdx:]
-	for _, blocker := range []string{" order by ", " limit ", ";"} {
-		if idx := strings.LastIndex(after, blocker); idx >= 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func inInsertColumnList(before string) bool {
-	insertIdx := lastKeyword(before, "insert into ")
-	valuesIdx := lastKeyword(before, " values")
-	openParen := strings.LastIndex(before, "(")
-	closeParen := strings.LastIndex(before, ")")
-	return insertIdx >= 0 && openParen > insertIdx && openParen > closeParen && valuesIdx < openParen
-}
-
-func inInsertValuesList(before string) bool {
-	insertIdx := lastKeyword(before, "insert into ")
-	valuesIdx := lastKeyword(before, " values")
-	openParen := strings.LastIndex(before, "(")
-	closeParen := strings.LastIndex(before, ")")
-	return insertIdx >= 0 && valuesIdx > insertIdx && openParen > valuesIdx && openParen > closeParen
-}
-
-func inUpdateSetList(before string) bool {
-	updateIdx := lastKeyword(before, "update ")
-	setIdx := lastKeyword(before, " set ")
-	if updateIdx < 0 || setIdx < updateIdx {
-		return false
-	}
-	lastWhere := lastKeyword(before, " where ")
-	if lastWhere > setIdx {
-		return false
-	}
-	for _, blocker := range []string{" = ", " != ", " > ", " < ", " like ", "\n"} {
-		if idx := strings.LastIndex(before, blocker); idx > setIdx {
-			return false
-		}
-	}
-	return true
-}
-
-func inFromTable(before string) bool {
-	fromIdx := lastKeyword(before, " from ")
-	if fromIdx < 0 {
-		return false
-	}
-	after := before[fromIdx:]
-	for _, blocker := range []string{" where ", " join ", " group by ", " order by ", " limit ", ";", "\n"} {
-		if idx := strings.LastIndex(after, blocker); idx >= 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func inJoinTable(before string) bool {
-	joinIdx := lastKeyword(before, " join ")
-	if joinIdx < 0 {
-		return false
-	}
-	after := before[joinIdx:]
-	for _, blocker := range []string{" on ", " where ", " group by ", " order by ", " limit ", ";", "\n"} {
-		if idx := strings.LastIndex(after, blocker); idx >= 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func inUpdateTable(before string) bool {
-	updateIdx := lastKeyword(before, "update ")
-	if updateIdx < 0 {
-		return false
-	}
-	after := before[updateIdx:]
-	for _, blocker := range []string{" set ", " where ", ";", "\n"} {
-		if idx := strings.LastIndex(after, blocker); idx >= 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func inInsertIntoTable(before string) bool {
-	insertIdx := lastKeyword(before, "insert into ")
-	if insertIdx < 0 {
-		return false
-	}
-	after := before[insertIdx:]
-	for _, blocker := range []string{"(", " values", ";", "\n"} {
-		if idx := strings.LastIndex(after, blocker); idx >= 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func inDeleteFromTable(before string) bool {
-	deleteIdx := lastKeyword(before, "delete from ")
-	if deleteIdx < 0 {
-		return false
-	}
-	after := before[deleteIdx:]
-	for _, blocker := range []string{" where ", ";", "\n"} {
-		if idx := strings.LastIndex(after, blocker); idx >= 0 {
-			return false
-		}
-	}
-	return true
 }
 
 func (m Model) currentHistoryQuery() string {
@@ -4669,15 +2772,15 @@ func (m Model) updateColumnPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.columnPickerValueCursor = 0
 		return m, nil
 	case "tab":
-		items := make([]columnPickerItem, 0, len(m.columnPickerItems))
+		items := make([]completion.Item, 0, len(m.columnPickerItems))
 		for _, item := range m.columnPickerItems {
-			if item.selected {
+			if item.Selected {
 				items = append(items, item)
 			}
 		}
 		if len(items) == 0 {
 			if m.columnPickerMulti && m.columnPickerFallback != "" {
-				items = append(items, columnPickerItem{insertText: m.columnPickerFallback})
+				items = append(items, completion.Item{InsertText: m.columnPickerFallback})
 			} else if len(m.columnPickerItems) > 0 {
 				items = append(items, m.columnPickerItems[m.columnPickerCursor])
 			}
@@ -4687,12 +2790,7 @@ func (m Model) updateColumnPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.columnPickerValueMode = false
 		m.columnPickerValuePrefix = ""
 		m.columnPickerValueCursor = 0
-		m.applyCompletionInsertion(queryColumnContext{
-			start:    m.columnPickerStart,
-			end:      m.columnPickerEnd,
-			fallback: m.columnPickerFallback,
-			multi:    m.columnPickerMulti,
-		}, items)
+		m.applyCompletionInsertion(m.columnPickerStart, m.columnPickerEnd, m.columnPickerFallback, m.columnPickerMulti, items)
 		if !valueMode {
 			m.setStatus("inserted completion")
 		}
@@ -4757,7 +2855,7 @@ func (m Model) updateColumnPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			_, refreshCmd := m.refreshCompletionPicker(false)
 			return m, tea.Batch(cmd, refreshCmd)
 		}
-		m.columnPickerItems[m.columnPickerCursor].selected = !m.columnPickerItems[m.columnPickerCursor].selected
+		m.columnPickerItems[m.columnPickerCursor].Selected = !m.columnPickerItems[m.columnPickerCursor].Selected
 	case "enter":
 		var cmd tea.Cmd
 		m.queryInput, cmd = m.queryInput.Update(msg)
@@ -4917,16 +3015,6 @@ func (m Model) queryCopyPickerItems() []queryPickerItem {
 	}
 }
 
-func (m Model) currentAliasPrefix(ctx queryColumnContext) string {
-	token := currentTokenValue([]rune(m.queryInput.Value())[ctx.start:ctx.end])
-	if idx := strings.LastIndex(token, "."); idx >= 0 {
-		alias := strings.TrimSpace(token[:idx])
-		if alias != "" {
-			return alias + "."
-		}
-	}
-	return ""
-}
 
 func (m Model) completionPickerCapturesTyping(msg tea.KeyMsg) bool {
 	switch msg.Type {
@@ -4949,7 +3037,7 @@ func (m Model) shouldAutoTriggerCompletion(msg tea.KeyMsg) bool {
 }
 
 func (m *Model) focusCursorAtIndex(idx int) {
-	line, col := queryLineColForIndex([]rune(m.queryInput.Value()), idx)
+	line, col := completion.LineColForIndex([]rune(m.queryInput.Value()), idx)
 	setTextareaCursor(&m.queryInput, line, col)
 }
 
@@ -5394,40 +3482,6 @@ func (m Model) preferredCategoricalColumn() string {
 		if strings.Contains(colType, "char") || strings.Contains(colType, "text") {
 			return col.Name
 		}
-	}
-	return ""
-}
-
-// preferredFilterColumnFromFields picks the best filter column from an explicit
-// field list, mirroring preferredFilterColumn but without reading m.tableSchema.
-func preferredFilterColumnFromFields(fields []string) string {
-	for _, name := range fields {
-		lower := strings.ToLower(name)
-		if strings.Contains(lower, "name") || strings.Contains(lower, "email") || strings.Contains(lower, "status") {
-			return name
-		}
-	}
-	if len(fields) > 0 {
-		return fields[0]
-	}
-	return ""
-}
-
-// preferredCategoricalColumnFromFields picks the best categorical column from
-// an explicit field list, mirroring preferredCategoricalColumn.
-func preferredCategoricalColumnFromFields(fields []string, types map[string]string) string {
-	for _, name := range fields {
-		lower := strings.ToLower(name)
-		colType := strings.ToLower(types[name])
-		if strings.Contains(lower, "status") || strings.Contains(lower, "type") || strings.Contains(lower, "role") || strings.Contains(lower, "category") {
-			return name
-		}
-		if strings.Contains(colType, "char") || strings.Contains(colType, "text") {
-			return name
-		}
-	}
-	if len(fields) > 0 {
-		return fields[0]
 	}
 	return ""
 }

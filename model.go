@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"dbkit/internal/completion"
 	"dbkit/internal/config"
 	"dbkit/internal/db"
 )
@@ -39,13 +40,6 @@ type queryPickerItem struct {
 	value      string
 	kind       string
 	sectionRow bool
-}
-
-type columnPickerItem struct {
-	label      string
-	detail     string
-	insertText string
-	selected   bool
 }
 
 type confirmAction int
@@ -222,7 +216,7 @@ type Model struct {
 	// Modal overlay: column picker
 	showColumnPicker     bool
 	columnPickerTitle    string
-	columnPickerItems    []columnPickerItem
+	columnPickerItems    []completion.Item
 	columnPickerCursor   int
 	columnPickerMulti    bool
 	columnPickerStart    int

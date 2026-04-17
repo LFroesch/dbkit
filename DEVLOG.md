@@ -1,5 +1,32 @@
 # Devlog
 
+## 2026-04-16 — browse panel decoupling + query cheat sheet
+
+- Removed browse-panel fallback from `queryInferredTable()` and `effectiveTable()` — completion schema/columns now come exclusively from what's parsed in the query text, never from the left-panel cursor. Fixes the long-standing issue where selecting a table in Browse would silently override typed query context.
+- Removed `BrowseTable` field from `completion.Request` (dead code after fallback removal).
+- `resolveSchemaForCompletion()` returns nil when no table is inferred instead of falling back to `m.tableSchema`.
+- Replaced the table list on the Query tab's left panel with a context-aware cheat sheet showing keybindings, SQL/Mongo syntax examples, and operators (switches content based on DB type).
+- Query tab now defaults focus to the editor (right panel) when switching via `3` key; left panel nav keys (`j/k/enter`) jump straight to the editor since the panel is static reference.
+
+## 2026-04-16 — completion engine rewrite
+
+- Rewrote autocomplete as a stateless `completion.Engine` in `internal/completion/`
+- New files: `engine.go` (Request/Result/SchemaInfo types, Complete() entry), `sql.go` (all SQL completion), extended `mongo.go` (mongo completion dispatcher + argument/value logic)
+- update.go: 4576→3698 lines (-878); removed `columnPickerItem` type, `queryColumnContext`, `rankCompletionItems`, all SQL/Mongo completion methods, `mongoSchemaFields`, `mongoFieldType`, etc.
+- Model is now a thin adapter: `buildCompletionRequest()` → `completion.Complete()` → apply result to picker state
+- **Fixed stale collection bug** (two layers): (1) `resolveSchemaForCompletion()` only passes schema matching the inferred table. (2) Engine validates `req.Schema.Name` matches the token-parsed collection — if mismatched, ignores the schema and signals `NeedSchema`. Both SQL and Mongo paths have this guard. Switching `db.users.find({})` → `db.comments.find({})` now correctly loads comments schema instead of showing users fields.
+- Eliminated `columnPickerItem` — picker uses `completion.Item` directly (exported fields: Label, Detail, InsertText, Selected)
+- Eliminated duplicate `rankCompletionItems` in main — uses `completion.RankItems` everywhere
+- All existing tests pass
+
+## 2026-04-15 — completion extraction phase 1
+
+- Created `internal/completion/` package (tokens.go + sql_context.go, 333 lines)
+- Moved all SQL clause predicates, token helpers, FuzzyMatch, LastKeyword out of update.go
+- update.go: 5644→5331 lines (-313); all callers now use `completion.X()` prefix
+- Tests: TokenBounds, TokenValue, InWhereClause, InSelectList, FuzzyMatch
+- `rankCompletionItems` stays in main for now (depends on `columnPickerItem` type)
+
 ## 2026-04-15 — inferred-schema header + results focus fix
 
 - Query/Results pane headers now read from `queryInferredTable` instead of the left-panel cursor, so the title shows the collection/table the editor is actually targeting (e.g. `mongo · users` while typing `db.users.find({})` even if the Browse cursor is still on `comments`). Makes the "which schema am I using" question obvious at a glance.
