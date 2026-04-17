@@ -565,6 +565,10 @@ func (m Model) updateQuery(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "ctrl+s":
 			return m.saveCurrentQuery()
 		case "tab":
+			if strings.TrimSpace(m.queryInput.Value()) == "" && m.activeDB != nil && m.activeDB.Type() != "mongo" && len(m.tables) > 0 {
+				m.openTableFirstPicker()
+				return m, nil
+			}
 			if ok, cmd := m.openCompletionForCursor(false); ok {
 				return m, cmd
 			}
@@ -2497,6 +2501,7 @@ func (m *Model) openCompletionForCursor(manual bool) (bool, tea.Cmd) {
 	m.columnPickerStart = result.Start
 	m.columnPickerEnd = result.End
 	m.columnPickerFallback = result.Fallback
+	m.columnPickerTableFirst = false
 	m.columnPickerValueMode = result.ValueMode
 	m.columnPickerValuePrefix = ""
 	m.columnPickerValueCursor = 0
@@ -2504,6 +2509,31 @@ func (m *Model) openCompletionForCursor(manual bool) (bool, tea.Cmd) {
 	m.columnPickerValueTable = result.ValueTable
 	m.showColumnPicker = true
 	return true, cmd
+}
+
+// openTableFirstPicker opens a table picker for the table-first SQL flow.
+// Selecting a table scaffolds SELECT * FROM <table>\nWHERE with cursor on *.
+func (m *Model) openTableFirstPicker() {
+	items := make([]completion.Item, 0, len(m.tables))
+	for _, name := range m.tables {
+		items = append(items, completion.Item{
+			Label:      name,
+			Detail:     "table",
+			InsertText: name,
+		})
+	}
+	m.columnPickerTitle = "Select Table"
+	m.columnPickerItems = items
+	m.columnPickerCursor = 0
+	m.columnPickerMulti = false
+	m.columnPickerStart = 0
+	m.columnPickerEnd = 0
+	m.columnPickerFallback = ""
+	m.columnPickerTableFirst = true
+	m.columnPickerValueMode = false
+	m.columnPickerValuePrefix = ""
+	m.columnPickerValueCursor = 0
+	m.showColumnPicker = true
 }
 
 func (m *Model) refreshCompletionPicker(manual bool) (bool, tea.Cmd) {
@@ -2517,8 +2547,10 @@ func (m *Model) refreshCompletionPicker(manual bool) (bool, tea.Cmd) {
 	result := completion.Complete(m.buildCompletionRequest())
 	if result == nil || len(result.Items) == 0 {
 		m.showColumnPicker = false
+		m.columnPickerTableFirst = false
 		return false, nil
 	}
+	m.columnPickerTableFirst = false
 	var cmd tea.Cmd
 	if result.NeedSchema != "" {
 		cmd = m.loadSchemaForCache(result.NeedSchema)
@@ -2616,6 +2648,10 @@ func (m *Model) applyCompletionInsertion(start, end int, fallback string, multi 
 
 
 func setTextareaCursor(input *textarea.Model, line, col int) {
+	// Go to absolute top-left first
+	for input.Line() > 0 {
+		input.CursorUp()
+	}
 	input.CursorStart()
 	for i := 0; i < line; i++ {
 		input.CursorDown()
@@ -2767,11 +2803,44 @@ func (m Model) updateColumnPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q":
 		m.showColumnPicker = false
+		m.columnPickerTableFirst = false
 		m.columnPickerValueMode = false
 		m.columnPickerValuePrefix = ""
 		m.columnPickerValueCursor = 0
 		return m, nil
 	case "tab":
+		if m.columnPickerTableFirst {
+			// Table-first flow: scaffold SELECT * FROM <table>\nWHERE
+			m.showColumnPicker = false
+			m.columnPickerTableFirst = false
+			table := ""
+			if len(m.columnPickerItems) > 0 {
+				item := m.columnPickerItems[m.columnPickerCursor]
+				table = item.InsertText
+				if table == "" {
+					table = item.Label
+				}
+			}
+			if table == "" {
+				return m, nil
+			}
+			dbType := ""
+			if m.activeDB != nil {
+				dbType = m.activeDB.Type()
+			}
+			quoted := completion.QuoteIdentifier(dbType, table)
+			query := fmt.Sprintf("SELECT * FROM %s\nWHERE ", quoted)
+			m.queryInput.SetValue(query)
+			m.queryInput.Focus()
+			// Position cursor on the * (index 7)
+			setTextareaCursor(&m.queryInput, 0, 7)
+			m.queryFocus = true
+			m.focus = panelRight
+			m.syncTableFocus()
+			// Prefetch schema for the selected table
+			cmd := m.prefetchInferredSchema()
+			return m, cmd
+		}
 		items := make([]completion.Item, 0, len(m.columnPickerItems))
 		for _, item := range m.columnPickerItems {
 			if item.Selected {

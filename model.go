@@ -221,7 +221,8 @@ type Model struct {
 	columnPickerMulti    bool
 	columnPickerStart    int
 	columnPickerEnd      int
-	columnPickerFallback string
+	columnPickerFallback   string
+	columnPickerTableFirst bool // table-first flow: selecting scaffolds SELECT * FROM <table>
 	// Value-completion mode: typing filters the list without inserting into the query.
 	columnPickerValueMode   bool
 	columnPickerValuePrefix string

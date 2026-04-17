@@ -26,7 +26,7 @@ func InWhereClause(before string) bool {
 	if start < 0 {
 		return false
 	}
-	for _, blocker := range []string{" = ", " != ", " > ", " < ", " like ", " in ", " is ", "\n"} {
+	for _, blocker := range []string{" = ", " != ", " > ", " < ", " like ", " in ", " is "} {
 		if idx := strings.LastIndex(before, blocker); idx > start {
 			return false
 		}
@@ -68,10 +68,8 @@ func InLimitValue(before string) bool {
 		return false
 	}
 	after := before[limitIdx+len(" limit "):]
-	for _, blocker := range []string{";", "\n"} {
-		if strings.Contains(after, blocker) {
-			return false
-		}
+	if strings.Contains(after, ";") {
+		return false
 	}
 	return true
 }
@@ -142,7 +140,7 @@ func InUpdateSetList(before string) bool {
 	if lastWhere > setIdx {
 		return false
 	}
-	for _, blocker := range []string{" = ", " != ", " > ", " < ", " like ", "\n"} {
+	for _, blocker := range []string{" = ", " != ", " > ", " < ", " like "} {
 		if idx := strings.LastIndex(before, blocker); idx > setIdx {
 			return false
 		}
@@ -156,7 +154,7 @@ func InFromTable(before string) bool {
 		return false
 	}
 	after := before[fromIdx:]
-	for _, blocker := range []string{" where ", " join ", " group by ", " order by ", " limit ", ";", "\n"} {
+	for _, blocker := range []string{" where ", " join ", " group by ", " order by ", " limit ", ";"} {
 		if idx := strings.LastIndex(after, blocker); idx >= 0 {
 			return false
 		}
@@ -170,7 +168,7 @@ func InJoinTable(before string) bool {
 		return false
 	}
 	after := before[joinIdx:]
-	for _, blocker := range []string{" on ", " where ", " group by ", " order by ", " limit ", ";", "\n"} {
+	for _, blocker := range []string{" on ", " where ", " group by ", " order by ", " limit ", ";"} {
 		if idx := strings.LastIndex(after, blocker); idx >= 0 {
 			return false
 		}
@@ -184,7 +182,7 @@ func InUpdateTable(before string) bool {
 		return false
 	}
 	after := before[updateIdx:]
-	for _, blocker := range []string{" set ", " where ", ";", "\n"} {
+	for _, blocker := range []string{" set ", " where ", ";"} {
 		if idx := strings.LastIndex(after, blocker); idx >= 0 {
 			return false
 		}
@@ -198,7 +196,7 @@ func InInsertIntoTable(before string) bool {
 		return false
 	}
 	after := before[insertIdx:]
-	for _, blocker := range []string{"(", " values", ";", "\n"} {
+	for _, blocker := range []string{"(", " values", ";"} {
 		if idx := strings.LastIndex(after, blocker); idx >= 0 {
 			return false
 		}
@@ -212,7 +210,7 @@ func InDeleteFromTable(before string) bool {
 		return false
 	}
 	after := before[deleteIdx:]
-	for _, blocker := range []string{" where ", ";", "\n"} {
+	for _, blocker := range []string{" where ", ";"} {
 		if idx := strings.LastIndex(after, blocker); idx >= 0 {
 			return false
 		}

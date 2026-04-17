@@ -96,6 +96,15 @@ func sqlOperatorCompletion(req Request) *Result {
 func sqlColumnCompletion(req Request) *Result {
 	query := []rune(req.Query)
 	start, end := TokenBounds(query, req.Cursor)
+	// Include * in the replacement range so SELECT * → SELECT col1, col2
+	cursorOnStar := false
+	if req.Cursor < len(query) && query[req.Cursor] == '*' && start == end {
+		end = req.Cursor + 1
+		cursorOnStar = true
+	} else if req.Cursor > 0 && req.Cursor <= len(query) && query[req.Cursor-1] == '*' && start == end {
+		start = req.Cursor - 1
+		cursorOnStar = true
+	}
 	beforeToken := strings.ToLower(string(query[:start]))
 	trimmed := strings.TrimSpace(beforeToken)
 
@@ -109,7 +118,7 @@ func sqlColumnCompletion(req Request) *Result {
 	var ctx colCtx
 	switch {
 	case InSelectList(beforeToken):
-		ctx = colCtx{title: "Select Columns", multi: true, includeStar: true}
+		ctx = colCtx{title: "Select Columns", multi: true, includeStar: !cursorOnStar}
 	case InWhereClause(beforeToken):
 		ctx = colCtx{title: "Filter Column", filterSuffix: " = ''"}
 	case InHavingClause(beforeToken):
@@ -137,11 +146,18 @@ func sqlColumnCompletion(req Request) *Result {
 	// Build column items from schema
 	items := sqlColumnItems(req, ctx.includeStar, aliasPrefix, prefix)
 
-	// If we have no columns and the schema is missing, signal a load
+	// Signal a schema load if we have no real columns (only * or empty)
 	var needSchema string
-	if len(items) == 0 && req.Schema == nil && req.InferredTable != "" {
+	hasRealCols := false
+	for _, item := range items {
+		if item.Label != "*" {
+			hasRealCols = true
+			break
+		}
+	}
+	if !hasRealCols && req.Schema == nil && req.InferredTable != "" {
 		needSchema = req.InferredTable
-		items = []Item{{Label: "loading fields…", Detail: req.InferredTable, InsertText: ""}}
+		items = append(items, Item{Label: "loading fields…", Detail: req.InferredTable, InsertText: ""})
 	}
 
 	if len(items) == 0 {
@@ -359,9 +375,6 @@ func sqlKeywordCompletion(req Request) *Result {
 	beforeToken := strings.ToLower(string(query[:start]))
 	trimmed := strings.TrimSpace(beforeToken)
 
-	if trimmed != "" && token == "" {
-		return nil
-	}
 	if token != "" {
 		for _, r := range token {
 			if !unicode.IsLetter(r) {
@@ -370,13 +383,15 @@ func sqlKeywordCompletion(req Request) *Result {
 		}
 	}
 
+	// Don't suggest after a completed statement
+	if strings.HasSuffix(trimmed, ";") {
+		return nil
+	}
+
 	title := "SQL Keywords"
-	switch {
-	case trimmed == "":
+	if trimmed == "" {
 		title = "SQL Starters"
-	case strings.HasSuffix(trimmed, "from") || strings.HasSuffix(trimmed, "join") ||
-		strings.HasSuffix(trimmed, "where") || strings.HasSuffix(trimmed, "group by") ||
-		strings.HasSuffix(trimmed, "order by"):
+	} else {
 		title = "SQL Clauses"
 	}
 
@@ -411,40 +426,61 @@ func sqlKeywordItems(req Request) []Item {
 	sortCol := fallbackName(preferredSortColumn(req.Schema), "column_name")
 	before := strings.ToLower(queryBeforeCursor(req))
 	q := QuoteIdentifier
+	trimmed := strings.TrimSpace(before)
 
-	items := []Item{
+	// If there's existing query content, show only contextual next-clause items
+	if trimmed != "" {
+		var items []Item
+
+		if InSelectList(before) || InHavingClause(before) {
+			items = append(items,
+				Item{Label: "COUNT(*)", Detail: "aggregate", InsertText: "COUNT(*)"},
+				Item{Label: "COUNT(col)", Detail: "aggregate", InsertText: fmt.Sprintf("COUNT(%s)", q(req.DBType, filterCol))},
+				Item{Label: "SUM(col)", Detail: "aggregate", InsertText: fmt.Sprintf("SUM(%s)", q(req.DBType, filterCol))},
+				Item{Label: "AVG(col)", Detail: "aggregate", InsertText: fmt.Sprintf("AVG(%s)", q(req.DBType, filterCol))},
+				Item{Label: "MIN(col)", Detail: "aggregate", InsertText: fmt.Sprintf("MIN(%s)", q(req.DBType, sortCol))},
+				Item{Label: "MAX(col)", Detail: "aggregate", InsertText: fmt.Sprintf("MAX(%s)", q(req.DBType, sortCol))},
+				Item{Label: "DISTINCT col", Detail: "modifier", InsertText: fmt.Sprintf("DISTINCT %s", q(req.DBType, filterCol))},
+			)
+		}
+
+		// Next-clause suggestions based on what's already in the query
+		hasFrom := strings.Contains(trimmed, " from ")
+		hasWhere := strings.Contains(trimmed, " where ")
+		hasGroup := strings.Contains(trimmed, " group by ")
+		hasOrder := strings.Contains(trimmed, " order by ")
+		hasLimit := strings.Contains(trimmed, " limit ")
+
+		if hasFrom && !hasWhere {
+			items = append(items, Item{Label: "WHERE", Detail: "clause", InsertText: fmt.Sprintf("\nWHERE %s = ''", q(req.DBType, filterCol))})
+		}
+		if hasFrom {
+			items = append(items, Item{Label: "JOIN", Detail: "clause", InsertText: fmt.Sprintf("\nJOIN %s ON ", q(req.DBType, table))})
+		}
+		if hasFrom && !hasGroup {
+			items = append(items, Item{Label: "GROUP BY", Detail: "clause", InsertText: fmt.Sprintf("\nGROUP BY %s", q(req.DBType, filterCol))})
+		}
+		if hasFrom && !hasOrder {
+			items = append(items, Item{Label: "ORDER BY", Detail: "clause", InsertText: fmt.Sprintf("\nORDER BY %s DESC", q(req.DBType, sortCol))})
+		}
+		if !hasLimit {
+			items = append(items, Item{Label: "LIMIT", Detail: "clause", InsertText: "\nLIMIT 50"})
+		}
+		items = append(items, Item{Label: "AND", Detail: "keyword", InsertText: "AND"})
+		items = append(items, Item{Label: "OR", Detail: "keyword", InsertText: "OR"})
+
+		return items
+	}
+
+	// Empty query — show starters
+	return []Item{
 		{Label: "SELECT starter", Detail: "query", InsertText: fmt.Sprintf("SELECT *\nFROM %s\nLIMIT 50;", q(req.DBType, table))},
 		{Label: "INSERT starter", Detail: "query", InsertText: fmt.Sprintf("INSERT INTO %s (%s)\nVALUES ('');", q(req.DBType, table), q(req.DBType, filterCol))},
 		{Label: "UPDATE starter", Detail: "query", InsertText: fmt.Sprintf("UPDATE %s\nSET %s = ''\nWHERE %s = '';", q(req.DBType, table), q(req.DBType, filterCol), q(req.DBType, filterCol))},
 		{Label: "DELETE starter", Detail: "query", InsertText: fmt.Sprintf("DELETE FROM %s\nWHERE %s = '';", q(req.DBType, table), q(req.DBType, filterCol))},
-		{Label: "JOIN clause", Detail: "query", InsertText: fmt.Sprintf("JOIN %s ON ", q(req.DBType, table))},
-		{Label: "WHERE clause", Detail: "query", InsertText: fmt.Sprintf("WHERE %s = ''", q(req.DBType, filterCol))},
-		{Label: "GROUP BY clause", Detail: "query", InsertText: fmt.Sprintf("GROUP BY %s", q(req.DBType, filterCol))},
-		{Label: "ORDER BY clause", Detail: "query", InsertText: fmt.Sprintf("ORDER BY %s DESC", q(req.DBType, sortCol))},
-		{Label: "LIMIT clause", Detail: "query", InsertText: "LIMIT 50"},
 		{Label: "SELECT", Detail: "keyword", InsertText: "SELECT"},
-		{Label: "FROM", Detail: "keyword", InsertText: "FROM"},
-		{Label: "WHERE", Detail: "keyword", InsertText: "WHERE"},
-		{Label: "JOIN", Detail: "keyword", InsertText: "JOIN"},
-		{Label: "GROUP BY", Detail: "keyword", InsertText: "GROUP BY"},
-		{Label: "ORDER BY", Detail: "keyword", InsertText: "ORDER BY"},
-		{Label: "LIMIT", Detail: "keyword", InsertText: "LIMIT"},
 		{Label: "INSERT INTO", Detail: "keyword", InsertText: "INSERT INTO"},
 		{Label: "UPDATE", Detail: "keyword", InsertText: "UPDATE"},
 		{Label: "DELETE FROM", Detail: "keyword", InsertText: "DELETE FROM"},
 	}
-
-	if InSelectList(before) || InHavingClause(before) {
-		items = append(items,
-			Item{Label: "COUNT(*)", Detail: "aggregate", InsertText: "COUNT(*)"},
-			Item{Label: "COUNT(col)", Detail: "aggregate", InsertText: fmt.Sprintf("COUNT(%s)", q(req.DBType, filterCol))},
-			Item{Label: "SUM(col)", Detail: "aggregate", InsertText: fmt.Sprintf("SUM(%s)", q(req.DBType, filterCol))},
-			Item{Label: "AVG(col)", Detail: "aggregate", InsertText: fmt.Sprintf("AVG(%s)", q(req.DBType, filterCol))},
-			Item{Label: "MIN(col)", Detail: "aggregate", InsertText: fmt.Sprintf("MIN(%s)", q(req.DBType, sortCol))},
-			Item{Label: "MAX(col)", Detail: "aggregate", InsertText: fmt.Sprintf("MAX(%s)", q(req.DBType, sortCol))},
-			Item{Label: "DISTINCT col", Detail: "modifier", InsertText: fmt.Sprintf("DISTINCT %s", q(req.DBType, filterCol))},
-		)
-	}
-
-	return items
 }

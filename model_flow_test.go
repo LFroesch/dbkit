@@ -383,6 +383,65 @@ func TestTabOpensColumnPickerFromQueryEditor(t *testing.T) {
 	}
 }
 
+func TestTableFirstFlowScaffoldsAndCursorOnStar(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users", "orders"}
+	m.schemaCache[schemaCacheKey(m.activeConnIdx, "users")] = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "id", Type: "integer", PrimaryKey: true},
+			{Name: "email", Type: "text"},
+		},
+	}
+
+	// Step 1: empty query + tab → table picker
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+	if !got.showColumnPicker {
+		t.Fatalf("expected table picker to open")
+	}
+	if got.columnPickerTitle != "Select Table" {
+		t.Fatalf("picker title = %q, want Select Table", got.columnPickerTitle)
+	}
+	if !got.columnPickerTableFirst {
+		t.Fatalf("expected columnPickerTableFirst to be set")
+	}
+
+	// Step 2: select "users" → scaffold query with cursor on *
+	next, _ = got.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	got = next.(Model)
+	if got.showColumnPicker {
+		t.Fatalf("picker should be closed after table selection")
+	}
+	want := "SELECT * FROM \"users\"\nWHERE "
+	if got.queryInput.Value() != want {
+		t.Fatalf("query = %q, want %q", got.queryInput.Value(), want)
+	}
+	// Cursor should be at position 7 (on the *)
+	cursorIdx := got.queryCursorIndex()
+	if cursorIdx != 7 {
+		t.Fatalf("cursor index = %d, want 7 (on *)", cursorIdx)
+	}
+
+	// Step 3: tab on * → column picker (multi-select)
+	next, _ = got.Update(tea.KeyMsg{Type: tea.KeyTab})
+	got = next.(Model)
+	if !got.showColumnPicker {
+		t.Fatalf("expected column picker to open on *")
+	}
+	if !got.columnPickerMulti {
+		t.Fatalf("expected multi-select column picker")
+	}
+	if got.columnPickerTitle != "Select Columns" {
+		t.Fatalf("picker title = %q, want Select Columns", got.columnPickerTitle)
+	}
+}
+
 func TestTypingInQueryEditorAutoOpensCompletionPicker(t *testing.T) {
 	m := newModel(&config.Config{})
 	m.activeDB = &fakeDB{dbType: "sqlite"}

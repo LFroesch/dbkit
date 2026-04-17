@@ -1,5 +1,13 @@
 # Devlog
 
+## 2026-04-16 — table-first SQL flow + completion fixes
+
+- **Table-first SQL completion**: empty query + tab now opens a table picker (SQLite/Postgres only). Selecting a table scaffolds `SELECT * FROM <table>\nWHERE ` with cursor positioned on `*`. Tabbing on `*` opens multi-select column picker — selected columns replace `*`. Gives a natural table→columns flow without inventing non-standard SQL.
+- **Mongo field ranking**: operators (`$and`, `$or`, etc.) now appear at the top of the field completion list, not the bottom.
+- **Mongo prefix bug**: `MongoJSONKeyBounds` was computing the correct replacement range but not updating the prefix used for `RankItems`, causing most fields to be filtered out when cursor was inside `{}`. Fixed by syncing prefix from the key bounds fallback.
+- **Multi-line SQL completion**: removed `\n` as a blocker from all SQL context detectors (`InWhereClause`, `InFromTable`, `InUpdateSetList`, etc.). Previously, any query spanning multiple lines would break clause detection — e.g. `SELECT *\nFROM users\nWHERE ` wouldn't trigger column completion on the WHERE line.
+- **Mongo schema sampling**: switched `GetTableSchema` from `Find().SetLimit(100)` (first 100 docs in insertion order) to `$sample` aggregation (random 100 docs across collection). Discovers fields that only exist in newer or less common documents.
+
 ## 2026-04-16 — browse panel decoupling + query cheat sheet
 
 - Removed browse-panel fallback from `queryInferredTable()` and `effectiveTable()` — completion schema/columns now come exclusively from what's parsed in the query text, never from the left-panel cursor. Fixes the long-standing issue where selecting a table in Browse would silently override typed query context.

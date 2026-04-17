@@ -414,7 +414,7 @@ func MongoJSONObjectItems(command string, fields []string, fieldTypes map[string
 	case "update":
 		items = append(MongoJSONUpdateOperatorItems(), items...)
 	default:
-		items = append(items, MongoJSONTopLevelOperatorItems()...)
+		items = append(MongoJSONTopLevelOperatorItems(), items...)
 	}
 	return items, len(items) > 0
 }
