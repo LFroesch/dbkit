@@ -143,6 +143,7 @@ func (m Model) renderFooter() string {
 			add("e", "edit cell")
 			add("v", "inspect")
 			add("c", "copy row")
+			add("C", "copy as")
 		} else if m.focus == panelRight {
 			add("↑/↓", "fields")
 			add("enter", "data view")
@@ -959,7 +960,7 @@ func (m Model) renderHelpModal() string {
 		keyStyle.Render("f / x / y") + " " + actionStyle.Render("templates / examples / history from Query"),
 		keyStyle.Render("g / u / s") + " " + actionStyle.Render("ai generate / saved / save from Query"),
 		keyStyle.Render("←/→") + " " + actionStyle.Render("page result columns"),
-		keyStyle.Render("c / C") + " " + actionStyle.Render("copy direct / copy as"),
+		keyStyle.Render("c / C") + " " + actionStyle.Render("copy direct / copy as (Browse/Results/Query)"),
 		keyStyle.Render("v") + " " + actionStyle.Render("inspect selected schema/result row"),
 		keyStyle.Render("esc") + " " + actionStyle.Render("close modal / blur editor"),
 		keyStyle.Render("q") + " " + actionStyle.Render("back (quit from connections)"),

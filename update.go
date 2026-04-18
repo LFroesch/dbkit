@@ -487,6 +487,8 @@ func (m Model) updateBrowseData(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "c":
 		return m.copyNamedText("row", m.currentBrowseRowJSON())
+	case "C":
+		m.openQueryPicker("Copy Browse Row As", m.browseCopyPickerItems())
 	}
 	return m, nil
 }
@@ -539,6 +541,25 @@ func (m Model) currentBrowseRowJSON() string {
 		return ""
 	}
 	return string(data)
+}
+
+func (m Model) currentBrowseCursor() int {
+	if m.browseData == nil || len(m.browseData.Rows) == 0 {
+		return 0
+	}
+	cursor := m.browseDataTable.Cursor()
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor >= len(m.browseData.Rows) {
+		cursor = len(m.browseData.Rows) - 1
+	}
+	return cursor
+}
+
+func (m Model) currentBrowseRowPrettyText() string {
+	_, copyText := m.renderRowInspect(m.browseData, m.currentBrowseCursor())
+	return copyText
 }
 
 // --- Query tab ---
@@ -3189,20 +3210,36 @@ func (m *Model) focusCursorAtIndex(idx int) {
 }
 
 func (m Model) resultCopyPickerItems() []queryPickerItem {
-	if m.queryResult == nil {
+	return m.copyPickerItemsForResult(
+		m.queryResult,
+		m.currentResultRowJSON(),
+		m.currentResultRowPrettyText(),
+	)
+}
+
+func (m Model) browseCopyPickerItems() []queryPickerItem {
+	return m.copyPickerItemsForResult(
+		m.browseData,
+		m.currentBrowseRowJSON(),
+		m.currentBrowseRowPrettyText(),
+	)
+}
+
+func (m Model) copyPickerItemsForResult(result *db.QueryResult, currentRowJSON, currentRowPretty string) []queryPickerItem {
+	if result == nil {
 		return nil
 	}
 	items := make([]queryPickerItem, 0, 5)
-	if row := m.currentResultRowJSON(); row != "" {
-		items = append(items, queryPickerItem{label: "Current row JSON", detail: "row json", value: row, kind: "copy"})
+	if currentRowJSON != "" {
+		items = append(items, queryPickerItem{label: "Current row JSON", detail: "row json", value: currentRowJSON, kind: "copy"})
 	}
-	if pretty := m.currentResultRowPrettyText(); pretty != "" {
-		items = append(items, queryPickerItem{label: "Current row inspect view", detail: "row detail", value: pretty, kind: "copy"})
+	if currentRowPretty != "" {
+		items = append(items, queryPickerItem{label: "Current row inspect view", detail: "row detail", value: currentRowPretty, kind: "copy"})
 	}
-	if data := m.allResultRowsJSON(); data != "" {
+	if data := allRowsJSON(result); data != "" {
 		items = append(items, queryPickerItem{label: "All rows JSON", detail: "rows json", value: data, kind: "copy"})
 	}
-	if data := m.allResultRowsCSV(); data != "" {
+	if data := allRowsCSV(result); data != "" {
 		items = append(items, queryPickerItem{label: "All rows CSV", detail: "rows csv", value: data, kind: "copy"})
 	}
 	return items
@@ -3333,12 +3370,16 @@ func structuredCopyValue(raw string) any {
 }
 
 func (m Model) allResultRowsJSON() string {
-	if m.queryResult == nil || len(m.queryResult.Rows) == 0 {
+	return allRowsJSON(m.queryResult)
+}
+
+func allRowsJSON(result *db.QueryResult) string {
+	if result == nil || len(result.Rows) == 0 {
 		return ""
 	}
-	rows := make([]map[string]any, 0, len(m.queryResult.Rows))
-	for _, row := range m.queryResult.Rows {
-		rows = append(rows, m.resultRowObject(row))
+	rows := make([]map[string]any, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		rows = append(rows, rowObject(result, row))
 	}
 	data, err := json.MarshalIndent(rows, "", "  ")
 	if err != nil {
@@ -3348,16 +3389,20 @@ func (m Model) allResultRowsJSON() string {
 }
 
 func (m Model) allResultRowsCSV() string {
-	if m.queryResult == nil {
+	return allRowsCSV(m.queryResult)
+}
+
+func allRowsCSV(result *db.QueryResult) string {
+	if result == nil {
 		return ""
 	}
 	var buf bytes.Buffer
 	writer := csv.NewWriter(&buf)
-	if err := writer.Write(m.queryResult.Columns); err != nil {
+	if err := writer.Write(result.Columns); err != nil {
 		return ""
 	}
-	for _, row := range m.queryResult.Rows {
-		record := make([]string, len(m.queryResult.Columns))
+	for _, row := range result.Rows {
+		record := make([]string, len(result.Columns))
 		copy(record, row)
 		if err := writer.Write(record); err != nil {
 			return ""

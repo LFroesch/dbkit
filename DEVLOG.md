@@ -1,5 +1,12 @@
 # Devlog
 
+## 2026-04-18 — v1 CLI surface and Browse export parity
+
+- **CLI wrap-up**: finished the non-TUI command-line surface so `bobdb` now responds cleanly to `--help` / `-h` / `help` and `--version` / `-v` / `version`. Unknown args now fail fast with a usage message instead of being ignored.
+- **Browse copy/export parity**: Browse data preview now gets the same `C` “copy as” flow that Results already had, so copying rows or exporting preview data as JSON/CSV no longer requires running the query first just to reach the Results tab.
+- **Tests/docs**: added regression coverage for the CLI argument handler and the Browse `C` overlay, and updated README/WORK to reflect the v1 copy/export and CLI scope.
+- Touched: `main.go`, `update.go`, `view.go`, `model_flow_test.go`, `README.md`, `WORK.md`, `DEVLOG.md`.
+
 ## 2026-04-18 — rename to `bobdb` with `bob` / `bdb` aliases
 
 - **Product rename**: renamed the app’s canonical product/binary/UI identity from `dbkit` to `bobdb`. Version output, window title, header text, keybind modal copy, module path, build output, and release artifact naming now use `bobdb`.

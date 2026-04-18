@@ -34,7 +34,7 @@ bdb
 | # | Tab | Description |
 |---|-----|-------------|
 | 1 | Connections | Add/delete/connect to saved databases |
-| 2 | Browse | Toggle between schema (fields/types) and data preview; press `enter` to swap views, `e` to build a contextual edit query |
+| 2 | Browse | Toggle between schema (fields/types) and data preview; press `enter` to swap views, `e` to build a contextual edit query, `C` to copy/export preview rows as JSON/CSV |
 | 3 | Query | Write and run raw SQL/Mongo commands with backend-aware typeahead, examples, templates, and schema-aware completion |
 | 4 | Results | Inspect the latest result set with structured row viewing and copy |
 
@@ -67,6 +67,7 @@ bdb
 | `esc` | Blur query editor |
 | `←` / `→` | Page visible query-result columns |
 | `c` | Copy the current table/value/detail/query/row where available |
+| `C` | Open `copy as` for query strings or Browse/Results rows (`JSON`, `CSV`, language string literals) |
 | `v` | Open the structured detail viewer |
 | `q` | Quit |
 | `?` | Help |
@@ -111,6 +112,14 @@ The Query tab uses a single assistance flow across backends:
 - `Templates` stay focused on quick actions and now load minimal editable starters; `Examples` stay separate and act as backend-specific reference commands (`read`, `filter`, `sort`, `aggregate`, `write`) so they teach query shape instead of behaving like generated actions.
 
 History/templates/examples/saved queries all stay overlay-based. Use `ctrl+o`, `ctrl+t`, `ctrl+e`, and `ctrl+u` from the editor, or the single-key shortcuts from the unfocused Query tab.
+
+Copy/export is intentionally clipboard-first for v1:
+
+- In Query, press `C` to copy the current query as raw text or as Go/JavaScript/Python/JSON string literals for dropping into another app.
+- In Browse data preview or Results, press `C` to copy the current row as structured text/JSON or copy the whole visible result set as JSON/CSV.
+- Plain `c` stays the fast path for the most obvious thing under the cursor; `C` is the “export / alternate format” path.
+
+Outside the TUI, `bobdb --help`, `bobdb help`, `bobdb --version`, and `bobdb version` are supported. Any other CLI args fail fast with a usage message instead of silently being ignored.
 
 The footer reflects the current mode — picker-open mode shows `↑/↓ · tab · enter · esc`, while edit mode stays trimmed to the main flow instead of listing every `ctrl+...` chord at once.
 

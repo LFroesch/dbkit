@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"strings"
 	"testing"
@@ -89,6 +90,101 @@ func TestSchemaRightPaneCIgnored(t *testing.T) {
 	if got.statusMsg != "" {
 		t.Fatalf("expected no status change, got %q", got.statusMsg)
 	}
+}
+
+func TestBrowseDataShiftCOpensCopyAsOverlay(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabBrowse
+	m.focus = panelRight
+	m.browseView = browseViewData
+	m.browseData = &db.QueryResult{
+		Columns: []string{"id", "email"},
+		Rows: [][]string{
+			{"1", "alice@example.com"},
+			{"2", "bob@example.com"},
+		},
+	}
+	m.syncBrowseDataTable()
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'C'}})
+	got := next.(Model)
+
+	if !got.showQueryPicker {
+		t.Fatalf("expected browse copy picker to open")
+	}
+	if got.queryPickerTitle != "Copy Browse Row As" {
+		t.Fatalf("picker title = %q, want Copy Browse Row As", got.queryPickerTitle)
+	}
+	if len(got.queryPickerItems) != 4 {
+		t.Fatalf("picker item count = %d, want 4", len(got.queryPickerItems))
+	}
+	if got.queryPickerItems[2].label != "All rows JSON" {
+		t.Fatalf("third item = %q, want All rows JSON", got.queryPickerItems[2].label)
+	}
+	if got.queryPickerItems[3].label != "All rows CSV" {
+		t.Fatalf("fourth item = %q, want All rows CSV", got.queryPickerItems[3].label)
+	}
+}
+
+func TestHandleCLIArgsHelpVersionAndUnknown(t *testing.T) {
+	t.Run("help", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code, handled := handleCLIArgs([]string{"--help"}, &stdout, &stderr)
+		if !handled {
+			t.Fatalf("expected help to be handled")
+		}
+		if code != 0 {
+			t.Fatalf("help exit code = %d, want 0", code)
+		}
+		if !strings.Contains(stdout.String(), "Usage:") {
+			t.Fatalf("help output missing usage: %q", stdout.String())
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("expected no stderr for help, got %q", stderr.String())
+		}
+	})
+
+	t.Run("version", func(t *testing.T) {
+		oldVersion := version
+		version = "1.2.3"
+		defer func() { version = oldVersion }()
+
+		var stdout, stderr bytes.Buffer
+		code, handled := handleCLIArgs([]string{"version"}, &stdout, &stderr)
+		if !handled {
+			t.Fatalf("expected version to be handled")
+		}
+		if code != 0 {
+			t.Fatalf("version exit code = %d, want 0", code)
+		}
+		if strings.TrimSpace(stdout.String()) != "bobdb 1.2.3" {
+			t.Fatalf("version output = %q", stdout.String())
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("expected no stderr for version, got %q", stderr.String())
+		}
+	})
+
+	t.Run("unknown", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code, handled := handleCLIArgs([]string{"--wat"}, &stdout, &stderr)
+		if !handled {
+			t.Fatalf("expected unknown arg to be handled")
+		}
+		if code != 2 {
+			t.Fatalf("unknown arg exit code = %d, want 2", code)
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("expected no stdout for unknown arg, got %q", stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "unknown argument") {
+			t.Fatalf("stderr missing unknown-argument message: %q", stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "Usage:") {
+			t.Fatalf("stderr missing usage: %q", stderr.String())
+		}
+	})
 }
 
 func TestTableViewportWidthUsesSinglePaneWidth(t *testing.T) {
