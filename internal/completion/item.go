@@ -16,6 +16,16 @@ type Item struct {
 // RankItems returns items ordered by relevance to prefix.
 // Exact prefix > contains > fuzzy. On empty prefix, returns a copy of items.
 func RankItems(prefix string, items []Item) []Item {
+	return rankItems(prefix, items, false)
+}
+
+// RankItemsKeepAll returns all items ordered by relevance to prefix.
+// Non-matching items remain available after the strongest matches.
+func RankItemsKeepAll(prefix string, items []Item) []Item {
+	return rankItems(prefix, items, true)
+}
+
+func rankItems(prefix string, items []Item, keepAll bool) []Item {
 	if len(items) == 0 {
 		return nil
 	}
@@ -39,7 +49,10 @@ func RankItems(prefix string, items []Item) []Item {
 		case FuzzyMatch(label, prefix), FuzzyMatch(insert, prefix):
 			score = 2
 		}
-		if score >= 0 {
+		if score >= 0 || keepAll {
+			if score < 0 {
+				score = 3
+			}
 			rankedItems = append(rankedItems, ranked{item: item, score: score})
 		}
 	}

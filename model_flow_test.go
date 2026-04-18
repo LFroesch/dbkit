@@ -220,6 +220,25 @@ func TestRenderPaneTitleFitsWidth(t *testing.T) {
 	}
 }
 
+func TestFormatDisplayValueTrimsTimestampFractionZeros(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"2026-04-18 12:34:56.000000+00", "2026-04-18 12:34:56+00"},
+		{"2026-04-18 12:34:56.120000+00", "2026-04-18 12:34:56.12+00"},
+		{"2026-04-18T12:34:56.000000Z", "2026-04-18T12:34:56Z"},
+		{"2026-04-18 12:34:56.000000 +0000 UTC", "2026-04-18 12:34:56 +0000 UTC"},
+		{"2026-04-18 12:34:56", "2026-04-18 12:34:56"},
+		{"not-a-timestamp", "not-a-timestamp"},
+	}
+	for _, tc := range cases {
+		if got := formatDisplayValue(tc.in); got != tc.want {
+			t.Fatalf("formatDisplayValue(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestSyncResultTableHandlesColumnCountChanges(t *testing.T) {
 	m := newModel(&config.Config{})
 	m.width = 120
@@ -240,24 +259,24 @@ func TestSyncResultTableHandlesColumnCountChanges(t *testing.T) {
 	}
 }
 
-func TestQueryHistoryRecall(t *testing.T) {
+func TestCtrlPOpensRecentQueriesOverlay(t *testing.T) {
 	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
 	m.pushQueryHistory("select 1;")
 	m.pushQueryHistory("select 2;")
 
-	m.recallPreviousQuery()
-	if got := m.queryInput.Value(); got != "select 2;" {
-		t.Fatalf("first history recall = %q, want newest query", got)
-	}
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	got := next.(Model)
 
-	m.recallPreviousQuery()
-	if got := m.queryInput.Value(); got != "select 1;" {
-		t.Fatalf("second history recall = %q, want older query", got)
+	if !got.showQueryPicker {
+		t.Fatalf("expected recent queries overlay to open")
 	}
-
-	m.recallNextQuery()
-	if got := m.queryInput.Value(); got != "select 2;" {
-		t.Fatalf("history forward recall = %q, want newer query", got)
+	if got.queryPickerTitle != "Recent Queries" {
+		t.Fatalf("picker title = %q, want Recent Queries", got.queryPickerTitle)
 	}
 }
 
@@ -442,6 +461,31 @@ func TestTableFirstFlowScaffoldsAndCursorOnStar(t *testing.T) {
 	}
 }
 
+func TestSelectOnlyTabUsesTableFirstPicker(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users", "orders"}
+	m.queryInput.SetValue("SELECT ")
+	m.queryInput.CursorEnd()
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+
+	if !got.showColumnPicker {
+		t.Fatalf("expected table picker to open for bare SELECT")
+	}
+	if got.columnPickerTitle != "Select Table" {
+		t.Fatalf("picker title = %q, want Select Table", got.columnPickerTitle)
+	}
+	if !got.columnPickerTableFirst {
+		t.Fatalf("expected table-first picker for bare SELECT")
+	}
+}
+
 func TestTypingInQueryEditorAutoOpensCompletionPicker(t *testing.T) {
 	m := newModel(&config.Config{})
 	m.activeDB = &fakeDB{dbType: "sqlite"}
@@ -521,6 +565,116 @@ func TestCtrlLClearsQueryEditorWhileCompletionPopoverIsOpen(t *testing.T) {
 	}
 	if got.showColumnPicker {
 		t.Fatalf("expected completion picker to close after clear")
+	}
+}
+
+func TestQueryReferencePgDownWorksWhileEditorFocused(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.width = 120
+	m.height = 30
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	got := next.(Model)
+
+	if got.queryRefScroll <= 0 {
+		t.Fatalf("expected query reference to scroll, got %d", got.queryRefScroll)
+	}
+	if !got.queryFocus {
+		t.Fatalf("expected editor focus to stay active")
+	}
+}
+
+func TestQueryReferenceEndScrollReachesOperatorTips(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.width = 120
+	m.height = 24
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	got := next.(Model)
+
+	view := stripANSIForTest(got.renderQueryCheatSheet(got.queryReferenceWidth(), got.queryReferenceViewportHeight()+4))
+	if !strings.Contains(view, "Operator tips") {
+		t.Fatalf("expected operator tips section to be reachable, got %q", view)
+	}
+	if !strings.Contains(view, "Accepting > / >= / < / <=") {
+		t.Fatalf("expected final operator tip line to be visible, got %q", view)
+	}
+}
+
+func TestQueryReferenceWrapAwareEndScrollReachesFinalWrappedLine(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.width = 90
+	m.height = 24
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	got := next.(Model)
+
+	view := stripANSIForTest(got.renderQueryCheatSheet(got.queryReferenceWidth(), got.queryReferenceViewportHeight()+4))
+	if !strings.Contains(view, "Accepting > / >=") {
+		t.Fatalf("expected wrapped operator tip line to remain visible, got %q", view)
+	}
+}
+
+func TestBackspaceEditsQueryWhileValueSuggestionsAreOpen(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeConnIdx = 1
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.queryInput.SetValue(`SELECT * FROM "users" WHERE "email" = 'ali'`)
+	m.showColumnPicker = true
+	m.columnPickerTitle = "Values"
+	m.columnPickerItems = []completion.Item{
+		{Label: "alice@example.com", InsertText: "alice@example.com"},
+		{Label: "bob@example.com", InsertText: "bob@example.com"},
+	}
+	m.columnPickerValueCol = "email"
+	m.columnPickerValueTable = "users"
+	m.columnValueCache[columnValueKey(1, "users", "email")] = []string{
+		"alice@example.com",
+		"bob@example.com",
+	}
+	setTextareaCursor(&m.queryInput, 0, len(`SELECT * FROM "users" WHERE "email" = 'ali`))
+
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyBackspace})
+	got := next.(Model)
+
+	if got.queryInput.Value() != `SELECT * FROM "users" WHERE "email" = 'al'` {
+		t.Fatalf("query text should edit in place, got %q", got.queryInput.Value())
+	}
+	if !got.showColumnPicker {
+		t.Fatalf("expected suggestions to stay open")
+	}
+}
+
+func TestSinglePaneQueryUsesReferenceLabel(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.width = 60
+	m.height = 20
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelLeft
+
+	view := stripANSIForTest(m.renderSinglePane(10))
+	if !strings.Contains(strings.ToLower(view), "reference") {
+		t.Fatalf("expected compact pane label to mention reference, got %q", view)
 	}
 }
 
@@ -1023,6 +1177,26 @@ func TestResultsTabResetsToFirstRowAndColumn(t *testing.T) {
 	}
 }
 
+func TestSlashOpensQueryTabAndFocusesEditor(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabBrowse
+	m.focus = panelLeft
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	got := next.(Model)
+
+	if got.activeTab != tabQuery {
+		t.Fatalf("active tab = %v, want query tab", got.activeTab)
+	}
+	if !got.queryFocus {
+		t.Fatalf("expected query editor focus")
+	}
+	if got.focus != panelRight {
+		t.Fatalf("focus = %v, want right panel", got.focus)
+	}
+}
+
 func TestResultsTabQNavigatesBackEvenIfQueryFocusIsStale(t *testing.T) {
 	m := newModel(&config.Config{})
 	m.activeDB = &fakeDB{dbType: "sqlite"}
@@ -1172,6 +1346,45 @@ func TestValueCompletionUsesCachedSamples(t *testing.T) {
 	}
 	if !labels["a@x.com"] || !labels["b@x.com"] {
 		t.Fatalf("expected cached sample values, got %v", labels)
+	}
+}
+
+func TestClosingQuotedSQLValueDoesNotReopenCompletion(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"posts"}
+	m.schemaCache[schemaCacheKey(m.activeConnIdx, "posts")] = &db.TableSchema{
+		Name: "posts",
+		Columns: []db.ColumnInfo{
+			{Name: "id", Type: "integer"},
+			{Name: "createdAt", Type: "timestamp"},
+		},
+	}
+	m.columnValueCache[columnValueKey(m.activeConnIdx, "posts", "createdAt")] = []string{"2026-04-09T15:51:30Z"}
+	m.queryInput.SetValue(`SELECT "id" FROM "posts" WHERE "createdAt" >= '`)
+	setTextareaCursor(&m.queryInput, 0, len(`SELECT "id" FROM "posts" WHERE "createdAt" >= '`))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected value completion to open")
+	}
+	if m.columnPickerTitle != "Values for createdAt" {
+		t.Fatalf("picker title = %q, want Values for createdAt", m.columnPickerTitle)
+	}
+
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+	if got.showColumnPicker {
+		t.Fatalf("picker should close after inserting selected value")
+	}
+
+	next, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'\''}})
+	got = next.(Model)
+	if got.showColumnPicker {
+		t.Fatalf("closing quote should not reopen completion, got %#v", got.columnPickerItems)
 	}
 }
 
@@ -1379,8 +1592,8 @@ func TestTemplateSelectionAutoOpensPlaceholderCompletion(t *testing.T) {
 	if !got.showColumnPicker {
 		t.Fatalf("expected completion picker to auto-open after loading template")
 	}
-	if got.columnPickerTitle != "Operator" {
-		t.Fatalf("picker title = %q, want Operator", got.columnPickerTitle)
+	if got.columnPickerTitle != "Filter Column" {
+		t.Fatalf("picker title = %q, want Filter Column", got.columnPickerTitle)
 	}
 }
 
@@ -2000,42 +2213,6 @@ func TestRankCompletionItemsMatchesContainsPrefixForDomains(t *testing.T) {
 	}
 }
 
-func TestValueFilterPrefixSupportsLeftRightEditing(t *testing.T) {
-	m := newModel(&config.Config{})
-	m.columnPickerValueMode = true
-	m.columnPickerValuePrefix = "@gmal"
-	m.columnPickerValueCursor = len([]rune(m.columnPickerValuePrefix))
-
-	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyLeft})
-	got := next.(Model)
-	next, _ = got.updateColumnPicker(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
-	got = next.(Model)
-
-	if got.columnPickerValuePrefix != "@gmail" {
-		t.Fatalf("filter prefix = %q, want @gmail", got.columnPickerValuePrefix)
-	}
-}
-
-func TestValueFilterSpaceEditsFilterNotQuery(t *testing.T) {
-	m := newModel(&config.Config{})
-	m.queryInput.SetValue(`SELECT * FROM users WHERE email = 'a'`)
-	m.showColumnPicker = true
-	m.columnPickerItems = []completion.Item{{Label: "alice@gmail.com", InsertText: "alice@gmail.com"}}
-	m.columnPickerValueMode = true
-	m.columnPickerValuePrefix = "@gmail"
-	m.columnPickerValueCursor = len([]rune(m.columnPickerValuePrefix))
-
-	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeySpace})
-	got := next.(Model)
-
-	if got.columnPickerValuePrefix != "@gmail " {
-		t.Fatalf("value filter prefix = %q, want %q", got.columnPickerValuePrefix, "@gmail ")
-	}
-	if got.queryInput.Value() != `SELECT * FROM users WHERE email = 'a'` {
-		t.Fatalf("query should not change in value filter mode, got %q", got.queryInput.Value())
-	}
-}
-
 func TestLeftRightMovesQueryCursorWhilePickerOpen(t *testing.T) {
 	m := newModel(&config.Config{})
 	m.activeDB = &fakeDB{dbType: "sqlite"}
@@ -2056,6 +2233,41 @@ func TestLeftRightMovesQueryCursorWhilePickerOpen(t *testing.T) {
 	after := got.queryCursorIndex()
 	if after >= before {
 		t.Fatalf("expected cursor to move left while picker open (before=%d after=%d)", before, after)
+	}
+}
+
+// Mongo shell-syntax write commands must require confirmation — bare
+// method-name matching was regressing because the original check split on
+// whitespace and the shell form has no spaces until inside the args.
+func TestMongoShellWriteRequiresConfirmation(t *testing.T) {
+	cases := []struct {
+		query string
+		want  bool
+	}{
+		{"db.users.insertOne({})", true},
+		{"db.users.insertMany([{}])", true},
+		{"db.users.updateOne({}, {\"$set\": {}})", true},
+		{"db.users.updateMany({}, {})", true},
+		{"db.users.replaceOne({}, {})", true},
+		{"db.users.deleteOne({})", true},
+		{"db.users.deleteMany({})", true},
+		{"db.users.findOneAndUpdate({}, {})", true},
+		{"db.users.findOneAndDelete({})", true},
+		{"db.users.bulkWrite([])", true},
+		{"db.users.drop()", true},
+		{"db.users.find({})", false},
+		{"db.users.findOne({})", false},
+		{"db.users.aggregate([])", false},
+		{"db.users.countDocuments({})", false},
+		{"insert users {}", true},
+		{"find users {}", false},
+	}
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	for _, tc := range cases {
+		if got := m.queryNeedsConfirmation(tc.query); got != tc.want {
+			t.Errorf("queryNeedsConfirmation(%q) = %v, want %v", tc.query, got, tc.want)
+		}
 	}
 }
 

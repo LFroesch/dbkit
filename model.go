@@ -166,6 +166,7 @@ type Model struct {
 	queryResult         *db.QueryResult
 	queryErr            string
 	queryFocus          bool // true = textarea focused
+	queryRefScroll      int
 	resultTable         table.Model
 	resultColOffset     int
 	resultVisibleColumn int
@@ -214,13 +215,13 @@ type Model struct {
 	queryPickerItems  []queryPickerItem
 	queryPickerCursor int
 	// Modal overlay: column picker
-	showColumnPicker     bool
-	columnPickerTitle    string
-	columnPickerItems    []completion.Item
-	columnPickerCursor   int
-	columnPickerMulti    bool
-	columnPickerStart    int
-	columnPickerEnd      int
+	showColumnPicker       bool
+	columnPickerTitle      string
+	columnPickerItems      []completion.Item
+	columnPickerCursor     int
+	columnPickerMulti      bool
+	columnPickerStart      int
+	columnPickerEnd        int
 	columnPickerFallback   string
 	columnPickerTableFirst bool // table-first flow: selecting scaffolds SELECT * FROM <table>
 	// Value-completion mode: typing filters the list without inserting into the query.

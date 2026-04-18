@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -11,6 +12,8 @@ import (
 
 	"dbkit/internal/db"
 )
+
+var fractionalTimestampPattern = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\.(\d+)(.*)$`)
 
 const (
 	minWidth  = 56
@@ -163,20 +166,19 @@ func (m Model) renderFooter() string {
 				}
 				add("esc", "close")
 			} else {
+				add("/", "query")
 				add("ctrl+r", "run")
 				add("tab", "complete")
-				add("ctrl+g", "ai generate")
-				add("ctrl+t", "templates")
-				add("ctrl+e", "examples")
-				add("ctrl+o", "recent")
-				add("ctrl+u", "saved")
-				add("ctrl+p/n", "history")
+				add("pgup/dn", "reference")
+				add("f/x/y/u", "pickers")
+				add("g/s", "ai/save")
 				add("ctrl+l", "clear")
-				add("ctrl+s", "save")
 				add("esc", "blur")
 			}
 		} else {
+			add("/", "editor")
 			add("enter", "editor")
+			add("pgup/dn", "reference")
 			add("g", "ai generate")
 			add("f", "templates")
 			add("x", "examples")
@@ -287,10 +289,7 @@ func (m Model) renderSinglePane(contentH int) string {
 		style = panelActiveStyle
 	}
 
-	header := "left pane"
-	if m.focus == panelRight || m.queryFocus {
-		header = "right pane"
-	}
+	header := m.compactPaneLabel()
 	chip := dimStyle.Render(" " + header + " ")
 	return style.Width(m.width - 2).Height(innerH).Render(chip + "\n" + body)
 }
@@ -368,57 +367,21 @@ func (m Model) renderTableList(w, h int) string {
 
 func (m Model) renderQueryCheatSheet(w, h int) string {
 	lines := []string{panelHeaderStyle.Render("Query Reference"), ""}
-
-	dbType := ""
-	if m.activeDB != nil {
-		dbType = m.activeDB.Type()
+	body := m.queryReferenceLinesForWidth(w)
+	viewH := max(1, h-4)
+	start := clampInt(m.queryRefScroll, 0, max(0, len(body)-viewH))
+	end := min(len(body), start+viewH)
+	lines = append(lines, body[start:end]...)
+	if start > 0 || end < len(body) {
+		meta := []string{}
+		if start > 0 {
+			meta = append(meta, "pgup/home ↑")
+		}
+		if end < len(body) {
+			meta = append(meta, "pgdn/end ↓")
+		}
+		lines = append(lines, "", dimStyle.Render(strings.Join(meta, " · ")))
 	}
-
-	section := func(title string) string {
-		return accentStyle.Render(title)
-	}
-	ex := func(s string) string {
-		return dimStyle.Render("  " + s)
-	}
-
-	switch dbType {
-	case "mongo":
-		lines = append(lines, section("Syntax"))
-		lines = append(lines, ex("db.<col>.find({})"))
-		lines = append(lines, ex("db.<col>.find({k: \"v\"})"))
-		lines = append(lines, ex("db.<col>.aggregate(["))
-		lines = append(lines, ex("  {$match: {k: \"v\"}}"))
-		lines = append(lines, ex("])"))
-		lines = append(lines, ex("db.<col>.insertOne({})"))
-		lines = append(lines, ex("db.<col>.updateOne("))
-		lines = append(lines, ex("  {filter}, {$set: {…}})"))
-		lines = append(lines, ex("db.<col>.deleteMany({})"))
-		lines = append(lines, "")
-		lines = append(lines, section("Operators"))
-		lines = append(lines, ex("$eq $ne $gt $gte $lt $lte"))
-		lines = append(lines, ex("$in $nin $exists $regex"))
-		lines = append(lines, ex("$and $or $not"))
-		lines = append(lines, ex("$set $unset $inc $push"))
-	default:
-		lines = append(lines, section("Syntax"))
-		lines = append(lines, ex("SELECT * FROM t LIMIT 50;"))
-		lines = append(lines, ex("SELECT c1, c2 FROM t"))
-		lines = append(lines, ex("  WHERE c1 = 'v';"))
-		lines = append(lines, ex("INSERT INTO t (c1)"))
-		lines = append(lines, ex("  VALUES ('v');"))
-		lines = append(lines, ex("UPDATE t SET c1 = 'v'"))
-		lines = append(lines, ex("  WHERE id = 1;"))
-		lines = append(lines, ex("DELETE FROM t WHERE …;"))
-		lines = append(lines, "")
-		lines = append(lines, section("Joins"))
-		lines = append(lines, ex("… JOIN t2 ON t.id=t2.fk"))
-		lines = append(lines, ex("LEFT JOIN / RIGHT JOIN"))
-		lines = append(lines, "")
-		lines = append(lines, section("Aggregates"))
-		lines = append(lines, ex("COUNT(*) SUM() AVG()"))
-		lines = append(lines, ex("GROUP BY c HAVING …"))
-	}
-
 	return padLines(lines, h)
 }
 
@@ -433,6 +396,170 @@ func (m Model) renderLastRunQuery(w, h int) string {
 		lines = append(lines, accentStyle.Render(line))
 	}
 	return padLines(lines, h)
+}
+
+type queryReferenceEntry struct {
+	kind string
+	text string
+}
+
+func (m Model) queryReferenceEntries() []queryReferenceEntry {
+	dbType := ""
+	if m.activeDB != nil {
+		dbType = m.activeDB.Type()
+	}
+	section := func(title string) queryReferenceEntry {
+		return queryReferenceEntry{kind: "section", text: title}
+	}
+	ex := func(s string) queryReferenceEntry {
+		return queryReferenceEntry{kind: "example", text: "  " + s}
+	}
+
+	lines := []queryReferenceEntry{}
+
+	switch dbType {
+	case "mongo":
+		lines = append(lines,
+			section("Read"),
+			ex(`db.posts.find({})`),
+			ex(`db.posts.find({"status":"published"})`),
+			ex(`db.posts.find({"created_at":{"$gte":{"$date":"2026-04-09T00:00:00Z"}}})`),
+			ex(`db.posts.find({}).sort({"created_at":-1}).limit(50)`),
+			queryReferenceEntry{},
+			section("Write"),
+			ex(`db.posts.insertOne({"title":"hello"})`),
+			ex(`db.posts.updateOne({"_id":{"$oid":"..."}} , {"$set":{"title":"new"}})`),
+			ex(`db.posts.deleteMany({"deleted_at":{"$exists":true}})`),
+			queryReferenceEntry{},
+			section("Aggregate"),
+			ex(`db.posts.aggregate([{"$match":{"status":"published"}},{"$group":{"_id":"$author_id","count":{"$sum":1}}}])`),
+			queryReferenceEntry{},
+			section("Operators"),
+			ex(`$eq $ne $gt $gte $lt $lte`),
+			ex(`$in $nin $exists $regex`),
+			ex(`$and $or $not $set $unset $inc`),
+		)
+	default:
+		lines = append(lines,
+			section("Read"),
+			ex(`SELECT "id", "title", "url"`),
+			ex(`FROM "posts"`),
+			ex(`WHERE "status" = 'published'`),
+			ex(`ORDER BY "created_at" DESC`),
+			ex(`LIMIT 50;`),
+			queryReferenceEntry{},
+			section("Dates / timestamps"),
+			ex(`WHERE "created_at" >= '2026-04-09 15:51:30+00';`),
+			ex(`WHERE "created_at" >= '2026-04-09T15:51:30Z';`),
+			ex(`Prefer quoted timestamp literals, not bare values.`),
+			queryReferenceEntry{},
+			section("Write"),
+			ex(`INSERT INTO "posts" ("title") VALUES ('hello');`),
+			ex(`UPDATE "posts" SET "title" = 'new' WHERE "id" = 1;`),
+			ex(`DELETE FROM "posts" WHERE "deleted_at" IS NOT NULL;`),
+			queryReferenceEntry{},
+			section("Aggregate / join"),
+			ex(`SELECT "author_id", COUNT(*) FROM "posts" GROUP BY "author_id";`),
+			ex(`SELECT p.*, a."name" FROM "posts" p JOIN "authors" a ON p."author_id" = a."id";`),
+			queryReferenceEntry{},
+			section("Operator tips"),
+			ex(`= != > >= < <= LIKE IN IS NULL`),
+			ex(`Accepting > / >= / < / <= inserts only the operator.`),
+		)
+	}
+	return lines
+}
+
+func (m Model) queryReferenceLinesForWidth(w int) []string {
+	entries := m.queryReferenceEntries()
+	lines := make([]string, 0, len(entries))
+	wrapW := max(12, w-1)
+	for _, entry := range entries {
+		if entry.text == "" {
+			lines = append(lines, "")
+			continue
+		}
+		for _, line := range wrapTextPreservingRuns(entry.text, wrapW) {
+			switch entry.kind {
+			case "section":
+				lines = append(lines, accentStyle.Render(line))
+			default:
+				lines = append(lines, dimStyle.Render(line))
+			}
+		}
+	}
+	return lines
+}
+
+func (m Model) queryReferenceWidth() int {
+	if m.isSinglePane() {
+		return max(10, m.width-4)
+	}
+	leftW := m.leftPanelWidth()
+	if m.isCompact() {
+		leftW = max(20, m.width*28/100)
+	}
+	rightW := m.width - leftW - 1
+	if rightW < 28 {
+		leftW = max(20, m.width-28-1)
+	}
+	return max(12, leftW-4)
+}
+
+func (m Model) queryReferenceViewportHeight() int {
+	contentH := max(1, m.height-5)
+	if m.isSinglePane() {
+		innerH := max(1, contentH-2)
+		bodyH := max(1, innerH-1)
+		return max(1, bodyH-4)
+	}
+	innerH := max(1, contentH-2)
+	return max(1, innerH-4)
+}
+
+func (m Model) queryReferencePageStep() int {
+	return max(1, m.queryReferenceViewportHeight()-2)
+}
+
+func (m Model) compactPaneLabel() string {
+	right := m.focus == panelRight || m.queryFocus
+	switch m.activeTab {
+	case tabConnections:
+		if right {
+			return "details"
+		}
+		return "connections"
+	case tabBrowse:
+		if right {
+			return "browse"
+		}
+		return "tables"
+	case tabQuery:
+		if right {
+			return "editor"
+		}
+		return "reference"
+	case tabResults:
+		if right {
+			return "results"
+		}
+		return "query"
+	case tabHistory:
+		if right {
+			return "selected query"
+		}
+		return "history"
+	case tabHelpers:
+		if right {
+			return "preview"
+		}
+		return "templates"
+	default:
+		if right {
+			return "details"
+		}
+		return "list"
+	}
 }
 
 func (m Model) renderHelperList(w, h int) string {
@@ -510,7 +637,7 @@ func (m Model) renderConnectionDetail(w, h int) string {
 		accentStyle.Render("id   ") + dimStyle.Render(conn.ID),
 	}
 
-	dsn := conn.DSN
+	dsn := maskDSNPassword(conn.DSN)
 	if utf8.RuneCountInString(dsn) > w-6 {
 		dsn = truncate(dsn, w-6)
 	}
@@ -635,7 +762,7 @@ func (m Model) renderQueryPanel(w, h int) string {
 		lines = append(lines, primaryStyle.Render("latest result ready in Results tab"))
 		lines = append(lines, dimStyle.Render(fmt.Sprintf("%d row(s) · press 4 to inspect", len(m.queryResult.Rows))))
 	default:
-		lines = append(lines, dimStyle.Render("Write a query, then press ctrl+r to run it."))
+		lines = append(lines, dimStyle.Render("Write a query, use tab to complete, ctrl+r to run, pgup/dn for reference."))
 	}
 	meta := m.renderQueryMeta()
 	if meta != "" {
@@ -792,7 +919,7 @@ func (m Model) renderNewConnModal() string {
 		saveLabel = activeTabStyle.Render(saveText)
 	}
 	lines = append(lines, "  [ "+saveLabel+" ]")
-	lines = append(lines, "", dimStyle.Render("tab inserts · left/right type · paste normally · esc cancel"))
+	lines = append(lines, "", dimStyle.Render("tab moves focus · left/right type · paste normally · esc cancel"))
 
 	return dialogStyle.Width(min(92, m.width-6)).Render(strings.Join(lines, "\n"))
 }
@@ -821,9 +948,11 @@ func (m Model) renderHelpModal() string {
 		keyStyle.Render("ctrl+e") + " " + actionStyle.Render("examples picker"),
 		keyStyle.Render("ctrl+o") + " " + actionStyle.Render("query history picker"),
 		keyStyle.Render("ctrl+u") + " " + actionStyle.Render("saved query picker"),
-		keyStyle.Render("ctrl+p / ctrl+n") + " " + actionStyle.Render("cycle history inline"),
 		keyStyle.Render("ctrl+s") + " " + actionStyle.Render("save current query"),
 		keyStyle.Render("ctrl+y") + " " + actionStyle.Render("last run"),
+		keyStyle.Render("/") + " " + actionStyle.Render("jump to Query editor"),
+		keyStyle.Render("pgup / pgdn") + " " + actionStyle.Render("scroll Query Reference"),
+		keyStyle.Render("home / end") + " " + actionStyle.Render("jump Query Reference"),
 		keyStyle.Render("tab") + " " + actionStyle.Render("accept completion"),
 		keyStyle.Render("f / x / y") + " " + actionStyle.Render("templates / examples / history from Query"),
 		keyStyle.Render("g / u / s") + " " + actionStyle.Render("ai generate / saved / save from Query"),
@@ -1177,7 +1306,27 @@ func compactInline(s string) string {
 }
 
 func fitTableCell(s string, width int) string {
-	return truncate(compactInline(s), max(1, width-1))
+	return truncate(compactInline(formatDisplayValue(s)), max(1, width-1))
+}
+
+func formatDisplayValue(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	match := fractionalTimestampPattern.FindStringSubmatch(s)
+	if len(match) != 4 {
+		return s
+	}
+	suffix := match[3]
+	if suffix != "" && !strings.HasPrefix(suffix, "Z") && !strings.HasPrefix(suffix, "+") && !strings.HasPrefix(suffix, "-") && !strings.HasPrefix(suffix, " ") {
+		return s
+	}
+	frac := strings.TrimRight(match[2], "0")
+	if frac == "" {
+		return match[1] + suffix
+	}
+	return match[1] + "." + frac + suffix
 }
 
 func (m Model) inspectViewportHeight() int {
@@ -1205,6 +1354,28 @@ func colorizeJSONLine(line string) string {
 		}
 	}
 	return textStyle.Render(line)
+}
+
+// maskDSNPassword replaces the password segment of a user:pass@host DSN
+// with asterisks so credentials don't appear on screen / in screenshots.
+// SQLite file paths and DSNs without credentials pass through unchanged.
+func maskDSNPassword(dsn string) string {
+	scheme := strings.Index(dsn, "://")
+	if scheme < 0 {
+		return dsn
+	}
+	rest := dsn[scheme+3:]
+	at := strings.Index(rest, "@")
+	if at < 0 {
+		return dsn
+	}
+	creds := rest[:at]
+	colon := strings.Index(creds, ":")
+	if colon < 0 {
+		return dsn
+	}
+	masked := creds[:colon+1] + strings.Repeat("*", len(creds)-colon-1)
+	return dsn[:scheme+3] + masked + rest[at:]
 }
 
 func truncate(s string, maxLen int) string {

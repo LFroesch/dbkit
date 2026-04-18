@@ -253,6 +253,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.showOllamaGen {
 			return m.updateOllamaGen(msg)
 		}
+		if m.activeTab == tabQuery && m.queryPageScrollKey(msg) {
+			return m.updateQueryPageScroll(msg)
+		}
 		if m.showColumnPicker && m.activeTab == tabQuery && m.queryFocus && queryEditorShortcutWhileCompletionOpen(msg) {
 			return m.updateQuery(msg)
 		}
@@ -290,6 +293,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "?":
 			m.showHelp = true
 			return m, nil
+		case "/":
+			if m.activeDB != nil {
+				m.openQueryTab()
+			}
+			return m, nil
 		case "1":
 			m.activeTab = tabConnections
 			m.focus = panelLeft
@@ -308,11 +316,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "3":
 			if m.activeDB != nil {
-				m.activeTab = tabQuery
-				m.focus = panelRight
-				m.queryFocus = true
-				m.queryInput.Focus()
-				m.syncTableFocus()
+				m.openQueryTab()
 			}
 			return m, nil
 		case "4":
@@ -351,6 +355,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m *Model) openQueryTab() {
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.syncTableFocus()
 }
 
 // --- Connections tab ---
@@ -543,10 +555,10 @@ func (m Model) updateQuery(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.openQueryPicker("Examples", m.queryExamplePickerItems())
 			return m, nil
 		case "ctrl+p":
-			m.recallPreviousQuery()
+			m.openQueryPicker("Recent Queries", m.queryHistoryPickerItems())
 			return m, nil
 		case "ctrl+n":
-			m.recallNextQuery()
+			m.openQueryPicker("Recent Queries", m.queryHistoryPickerItems())
 			return m, nil
 		case "ctrl+y":
 			m.recallLastRunQuery()
@@ -565,7 +577,7 @@ func (m Model) updateQuery(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "ctrl+s":
 			return m.saveCurrentQuery()
 		case "tab":
-			if strings.TrimSpace(m.queryInput.Value()) == "" && m.activeDB != nil && m.activeDB.Type() != "mongo" && len(m.tables) > 0 {
+			if m.shouldOpenTableFirstPicker() {
 				m.openTableFirstPicker()
 				return m, nil
 			}
@@ -636,6 +648,41 @@ func queryEditorShortcutWhileCompletionOpen(msg tea.KeyMsg) bool {
 	default:
 		return false
 	}
+}
+
+func (m Model) shouldOpenTableFirstPicker() bool {
+	if m.activeDB == nil || m.activeDB.Type() == "mongo" || len(m.tables) == 0 {
+		return false
+	}
+	trimmed := strings.TrimSpace(m.queryInput.Value())
+	return trimmed == "" || strings.EqualFold(trimmed, "select")
+}
+
+func (m Model) queryPageScrollKey(msg tea.KeyMsg) bool {
+	if m.showColumnPicker || m.showQueryPicker || m.showInspect || m.showConfirm || m.showNewConn || m.showOllamaGen {
+		return false
+	}
+	switch msg.String() {
+	case "pgup", "pgdown", "home", "end":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m Model) updateQueryPageScroll(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	maxScroll := max(0, len(m.queryReferenceLinesForWidth(m.queryReferenceWidth()))-m.queryReferenceViewportHeight())
+	switch msg.String() {
+	case "pgup":
+		m.queryRefScroll = max(0, m.queryRefScroll-m.queryReferencePageStep())
+	case "pgdown":
+		m.queryRefScroll = min(maxScroll, m.queryRefScroll+m.queryReferencePageStep())
+	case "home":
+		m.queryRefScroll = 0
+	case "end":
+		m.queryRefScroll = maxScroll
+	}
+	return m, nil
 }
 
 func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -2158,39 +2205,6 @@ func (m Model) saveCurrentQuery() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) recallPreviousQuery() {
-	if len(m.queryHistory) == 0 {
-		m.setStatus("no query history yet")
-		return
-	}
-	if m.queryHistoryIdx+1 >= len(m.queryHistory) {
-		m.queryHistoryIdx = len(m.queryHistory) - 1
-	} else {
-		m.queryHistoryIdx++
-	}
-	m.queryInput.SetValue(m.queryHistory[m.queryHistoryIdx])
-	m.queryInput.CursorEnd()
-	m.setStatus(fmt.Sprintf("history %d/%d", m.queryHistoryIdx+1, len(m.queryHistory)))
-}
-
-func (m *Model) recallNextQuery() {
-	if len(m.queryHistory) == 0 {
-		m.setStatus("no query history yet")
-		return
-	}
-	if m.queryHistoryIdx <= 0 {
-		m.queryHistoryIdx = -1
-		m.queryInput.SetValue("")
-		m.queryInput.CursorEnd()
-		m.setStatus("history cleared")
-		return
-	}
-	m.queryHistoryIdx--
-	m.queryInput.SetValue(m.queryHistory[m.queryHistoryIdx])
-	m.queryInput.CursorEnd()
-	m.setStatus(fmt.Sprintf("history %d/%d", m.queryHistoryIdx+1, len(m.queryHistory)))
-}
-
 func (m *Model) recallLastRunQuery() {
 	if strings.TrimSpace(m.lastRunQuery) == "" {
 		m.setStatus("no query run yet")
@@ -2326,13 +2340,7 @@ func (m Model) queryNeedsConfirmation(query string) bool {
 	}
 	switch m.activeDB.Type() {
 	case "mongo":
-		cmd, _ := nextQueryWord(query)
-		switch cmd {
-		case "insert", "update", "delete", "remove":
-			return true
-		default:
-			return false
-		}
+		return mongoQueryIsWrite(query)
 	default:
 		first := firstSQLKeyword(query)
 		switch first {
@@ -2342,6 +2350,41 @@ func (m Model) queryNeedsConfirmation(query string) bool {
 			return false
 		}
 	}
+}
+
+// mongoQueryIsWrite detects mutation commands in either shell syntax
+// (db.coll.insertOne(...)) or the internal whitespace-separated form
+// (insert coll ...). Lowercased query expected.
+func mongoQueryIsWrite(query string) bool {
+	if strings.HasPrefix(query, "db.") {
+		// Extract the method name between the second '.' and the first '('.
+		rest := query[3:]
+		dot := strings.Index(rest, ".")
+		if dot < 0 {
+			return false
+		}
+		rest = rest[dot+1:]
+		paren := strings.Index(rest, "(")
+		if paren < 0 {
+			return false
+		}
+		method := rest[:paren]
+		switch method {
+		case "insertone", "insertmany",
+			"updateone", "updatemany", "replaceone",
+			"deleteone", "deletemany", "remove",
+			"findoneandupdate", "findoneandreplace", "findoneanddelete",
+			"bulkwrite", "drop", "renamecollection":
+			return true
+		}
+		return false
+	}
+	cmd, _ := nextQueryWord(query)
+	switch cmd {
+	case "insert", "update", "delete", "remove":
+		return true
+	}
+	return false
 }
 
 func firstSQLKeyword(query string) string {
@@ -2585,7 +2628,7 @@ func (m *Model) refilterValuePicker() {
 	for _, v := range values {
 		items = append(items, completion.Item{Label: v, Detail: m.columnPickerValueCol, InsertText: v})
 	}
-	items = completion.RankItems(m.columnPickerValuePrefix, items)
+	items = completion.RankItemsKeepAll(strings.ToLower(m.columnPickerValuePrefix), items)
 	if len(items) == 0 {
 		if values == nil {
 			items = []completion.Item{{Label: "loading…", Detail: "fetching samples", InsertText: m.columnPickerValuePrefix}}
@@ -2645,7 +2688,6 @@ func (m *Model) applyCompletionInsertion(start, end int, fallback string, multi 
 	m.focus = panelRight
 	m.syncTableFocus()
 }
-
 
 func setTextareaCursor(input *textarea.Model, line, col int) {
 	// Go to absolute top-left first
@@ -3084,19 +3126,30 @@ func (m Model) queryCopyPickerItems() []queryPickerItem {
 	}
 }
 
-
 func (m Model) completionPickerCapturesTyping(msg tea.KeyMsg) bool {
 	switch msg.Type {
 	case tea.KeyRunes, tea.KeyBackspace, tea.KeyDelete:
 		return true
 	case tea.KeySpace:
-		return !m.columnPickerMulti
+		return !m.columnPickerMulti || m.columnPickerValueMode
+	case tea.KeyLeft, tea.KeyRight, tea.KeyHome, tea.KeyEnd:
+		return m.columnPickerValueMode
 	default:
 		return false
 	}
 }
 
 func (m Model) shouldAutoTriggerCompletion(msg tea.KeyMsg) bool {
+	if m.activeDB != nil && m.activeDB.Type() != "mongo" && msg.Type == tea.KeyRunes && len(msg.Runes) == 1 {
+		switch msg.Runes[0] {
+		case '\'', '"':
+			cursor := m.queryCursorIndex()
+			query := m.queryInput.Value()
+			if cursor > 0 && completion.CursorInsideString(query, cursor-1) && !completion.CursorInsideString(query, cursor) {
+				return false
+			}
+		}
+	}
 	switch msg.Type {
 	case tea.KeyRunes, tea.KeySpace, tea.KeyBackspace, tea.KeyDelete:
 		return true
@@ -3168,7 +3221,8 @@ func (m Model) renderRowInspect(result *db.QueryResult, cursor int) ([]string, s
 		if i < len(row) {
 			raw = row[i]
 		}
-		parts := structuredValueLines(raw)
+		displayRaw := formatDisplayValue(raw)
+		parts := structuredValueLines(displayRaw)
 		suffix := ""
 		if i < len(result.Columns)-1 {
 			suffix = ","

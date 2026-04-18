@@ -1,5 +1,55 @@
 # Devlog
 
+## 2026-04-18 — display polish: wrap-aware Query Reference and timestamp cleanup
+
+- **Wrap-aware Query Reference scrolling**: the Query Reference was still tracking scroll position in terms of source lines, but the left pane can visually wrap long examples into multiple on-screen rows. That mismatch is what made the bottom look clipped or oddly cut off. `view.go` now expands the reference into wrapped display rows for the current pane width and `update.go` scrolls against that rendered row count instead of the raw line count.
+- **Display-only timestamp cleanup**: SQL results were showing the raw driver string form of timestamps, including long all-zero fractional tails like `.000000`. `view.go` now trims only useless trailing fractional-second zero padding for timestamp-shaped display strings. This is render-time only: stored query results, copies, JSON export, and CSV export still use the raw original values.
+- **Tests**: added regression coverage in `model_flow_test.go` for timestamp display trimming and Query Reference end-scroll when the pane width forces wrapped rows.
+- Touched: `view.go`, `update.go`, `model_flow_test.go`, `WORK.md`, `DEVLOG.md`, `README.md`.
+
+## 2026-04-17 — query entry polish: global `/` shortcut and leaner footer
+
+- **Natural Query entry key**: `3` still works, but there was no obvious non-numeric way to jump straight into the Query editor from elsewhere in the app. `update.go` now maps `/` to "open Query and focus the editor" whenever the app is not already routing typing into a text input, so you can jump from Browse/Results into query writing with a single natural key.
+- **Leaner Query footer**: the focused Query footer had turned into a dense list of `ctrl+...` hints. `view.go` now keeps the high-frequency actions visible (`/`, run, complete, reference paging, clear, blur) and compresses the auxiliary actions into the existing single-key Query affordances (`f/x/y/u` pickers, `g/s` AI/save) instead of rendering a long row of control-chord hints.
+- **Tests**: added regression coverage in `model_flow_test.go` to ensure `/` opens the Query tab and focuses the editor.
+- Touched: `update.go`, `view.go`, `model_flow_test.go`, `WORK.md`, `README.md`, `DEVLOG.md`.
+
+## 2026-04-17 — query UX follow-up: bare SELECT picker, reference end-scroll, quote-close suppression
+
+- **Bare `SELECT` table-first flow**: pressing `tab` on an empty SQL editor already opened the table-first picker, but `SELECT<tab>` and `SELECT <tab>` were falling back to generic completion instead of treating that as the same starting intent. `update.go` now routes both empty SQL and bare-`SELECT` states through the same table picker flow so the next action is consistently "pick a table, scaffold the query, then replace `*`".
+- **Query Reference bottom reachability**: the Query Reference scroll bounds were computed from a viewport height that did not match the actual rendered left-pane body, especially in split-pane mode. That made the bottom section (`Operator tips`) partially unreachable and looked like the left panel was cut off. `view.go` now derives the reference viewport from the real panel/body height path used by rendering, so `end` and repeated paging can reach the final lines.
+- **Closing quoted SQL values no longer reopens generic completion**: after accepting a sampled SQL value and typing the closing quote, completion auto-trigger logic treated that quote like any other character and reopened a generic picker immediately. `update.go` now suppresses auto-trigger when a typed quote is specifically closing an existing SQL string literal, so finishing `'2026-04-09T15:51:30Z'` does not immediately flash unrelated suggestions.
+- **Tests**: added regression coverage in `model_flow_test.go` for bare-`SELECT` table picking, Query Reference end-scroll showing the final operator-tip line, and closing a quoted SQL value without reopening completion.
+- Touched: `update.go`, `view.go`, `model_flow_test.go`, `WORK.md`, `README.md`, `DEVLOG.md`.
+
+## 2026-04-17 — query UX stabilization: operator fix, value suggestions, reference paging
+
+- **SQL operator completion fix**: comparison operators (`>`, `>=`, `<`, `<=`) were inserting placeholder numeric literals like `>= 0`. If the user then accepted a sampled timestamp/string value, the query turned into malformed SQL such as `>= 0 '2026-04-09...'`. Operator items in `internal/completion/sql_helpers.go` now insert only the operator plus spacing, while quoted scaffolds remain for operators that actually need them (`=`, `!=`, `LIKE`, `IN`, etc.).
+- **Value-suggestion flow fix**: the sample-value picker no longer takes over editing with a separate local filter buffer. Query edits stay in the textarea, backspace/delete continue changing the query itself, and sampled values refresh around the current literal so autocomplete feels like a helper instead of a mode switch.
+- **Scrollable Query Reference**: the left Query Reference pane now has its own viewport state and responds to `pgup` / `pgdn` / `home` / `end` even while the editor is focused. Reworked the reference content to emphasize valid query shapes, especially quoted timestamp examples for SQL, and added overflow hints so it is clear when more content exists.
+- **Query-page polish**: history/templates/examples/saved queries stay overlay-based, `ctrl+p` / `ctrl+n` now open the recent-query overlay instead of cycling inline, compact single-pane labels use contextual names like `reference` / `editor`, Query footer/help copy now advertises the actual ctrl-shortcuts and reference paging, and the new-connection modal no longer incorrectly claims that `tab` inserts text.
+- **Tests**: added regression coverage for the operator insertion fix, recent-query overlay opening, Query Reference paging while editor-focused, compact Query labels, and backspace editing while value suggestions are open.
+- Touched: `model.go`, `update.go`, `view.go`, `internal/completion/item.go`, `internal/completion/sql_helpers.go`, `model_flow_test.go`, `internal/completion/tokens_test.go`, `README.md`, `WORK.md`, `DEVLOG.md`.
+
+## 2026-04-17 — v1 wrap-up: confirmation bug, multi-line clauses, DSN masking
+
+- **Mongo write confirmation fix**: `queryNeedsConfirmation` was splitting the query on whitespace, but shell syntax (`db.users.insertOne({...})`) has no space until inside the args — so the first "word" was the whole expression and never matched `insert` / `update` / `delete`. Destructive Mongo commands were silently bypassing the confirm dialog. Replaced with a shell-aware `mongoQueryIsWrite` that extracts the method name between the second `.` and the first `(` and checks against the full write-method set (`insertOne`, `insertMany`, `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, `deleteMany`, `findOneAndUpdate`, `findOneAndDelete`, `findOneAndReplace`, `bulkWrite`, `drop`, `renameCollection`). The legacy internal format (`insert users {}`) still confirms via the whitespace path.
+- **Multi-line SQL clause detection**: context predicates in `internal/completion/sql_context.go` looked for `" where "`, `" and "`, `" or "`, `" having "`, `" order by "`, `" limit "` — keywords with a leading *space*. When the clause keyword sat at the start of a new line (`\nwhere`, `\nand`), no match. Added `normalizeWhitespace` that collapses any run of whitespace (`\n`, `\t`, multiple spaces) to a single space before the keyword searches run. `ResolveSQLContext`, `InWhereClause`, `InHavingClause`, `sqlColumnCompletion.beforeToken`, and `sqlKeywordItems.before` all consume the normalized form now.
+- **Tests**: `TestMultiLineClauseDetection` in `internal/completion/tokens_test.go` covers newline-prefixed WHERE / AND / ORDER BY / LIMIT / HAVING and the ORDER BY direction edge case. `TestMongoShellWriteRequiresConfirmation` in `model_flow_test.go` covers every shell-syntax write method.
+- **DSN masking**: `renderConnectionDetail` now pipes `conn.DSN` through `maskDSNPassword`, which replaces the password segment (`user:***@host`) on display only. Edit form and `c` (copy DSN) still work against the real string so the user retains full control.
+- **Cleanup**: removed the local `max` in `sql_context.go` (Go 1.25 module; builtin `max` is available).
+- **README**: added a dedicated Ollama section. Schema names (not row data) are transmitted per request, and pointing `DBKIT_OLLAMA_HOST` at a remote endpoint means that metadata leaves the machine — call that out explicitly so users stay on localhost unless they opt in.
+- Touched: `update.go`, `view.go`, `internal/completion/sql.go`, `internal/completion/sql_context.go`, `internal/completion/tokens_test.go`, `model_flow_test.go`, `README.md`, `WORK.md`, `DEVLOG.md`.
+
+## 2026-04-16 — SQL token-first completion cleanup
+
+- Refactored SQL completion context handling around an explicit `ResolveSQLContext` pass in `internal/completion/sql_context.go` instead of spreading overlapping clause heuristics across `sql.go`.
+- Tightened single-table SQL flows so mid-query `tab` favors the next local unit only: filter columns, operators, values, `ORDER BY` direction, `LIMIT` values, and bare clause keywords like `WHERE` / `ORDER BY` / `LIMIT`.
+- Removed aggressive mid-query clause scaffolds from SQL keyword completion. Empty-editor starters still insert full starter queries, but once the query has content the picker no longer injects larger bodies like `WHERE col = ''` or `ORDER BY col DESC`.
+- Fixed a context bug exposed by the refactor where `FROM users ` could still reopen table completion and where a blank `WHERE ` position could be misread as an operator context.
+- Updated regression coverage for SQL context resolution and the new token-first clause behavior. Also updated the query-template flow test to expect `WHERE ` to open filter-column completion instead of operator completion.
+- Touched: `internal/completion/sql.go`, `internal/completion/sql_context.go`, `internal/completion/engine_test.go`, `internal/completion/tokens_test.go`, `model_flow_test.go`, `WORK.md`, `README.md`, `DEVLOG.md`.
+
 ## 2026-04-16 — table-first SQL flow + completion fixes
 
 - **Table-first SQL completion**: empty query + tab now opens a table picker (SQLite/Postgres only). Selecting a table scaffolds `SELECT * FROM <table>\nWHERE ` with cursor positioned on `*`. Tabbing on `*` opens multi-select column picker — selected columns replace `*`. Gives a natural table→columns flow without inventing non-standard SQL.

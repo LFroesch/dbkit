@@ -7,16 +7,20 @@ import (
 	"unicode"
 )
 
-var sqlPredicateOperatorPattern = regexp.MustCompile(`(?i)(?:"[^"]+"|[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)\s*$`)
+// Operator completion only fires after an identifier followed by at least
+// one whitespace char — otherwise the cursor is still touching the
+// identifier and accepting an operator would overwrite the column name.
+var sqlPredicateOperatorPattern = regexp.MustCompile(`(?i)(?:"[^"]+"|[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)\s+$`)
 
 func sqlComplete(req Request) *Result {
 	// Validate schema matches the inferred table to prevent stale data
 	if req.Schema != nil && req.InferredTable != "" && !strings.EqualFold(req.Schema.Name, req.InferredTable) {
 		req.Schema = nil
 	}
-	before := strings.ToLower(queryBeforeCursor(req))
+	before := queryBeforeCursor(req)
+	ctx := ResolveSQLContext(before)
 
-	if InInsertValuesList(before) {
+	if ctx.kind == sqlCtxInsertValuesList {
 		return nil
 	}
 
@@ -28,23 +32,31 @@ func sqlComplete(req Request) *Result {
 		return nil
 	}
 
-	if r := sqlOperatorCompletion(req); r != nil {
+	// Past an operator but no value typed yet. Value completion fires via the
+	// quote path (sqlValueCompletion above); here we just suppress the
+	// keyword/column fallbacks so they don't misfire between operator and
+	// value literal.
+	if ctx.kind == sqlCtxPredicateValue {
+		return nil
+	}
+
+	if r := sqlOperatorCompletion(req, ctx); r != nil {
 		return r
 	}
 
-	if r := sqlColumnCompletion(req); r != nil {
+	if r := sqlColumnCompletion(req, ctx); r != nil {
 		return r
 	}
 
-	if r := sqlTableCompletion(req); r != nil {
+	if r := sqlTableCompletion(req, ctx); r != nil {
 		return r
 	}
 
-	if r := sqlClauseValueCompletion(req); r != nil {
+	if r := sqlClauseValueCompletion(req, ctx); r != nil {
 		return r
 	}
 
-	return sqlKeywordCompletion(req)
+	return sqlKeywordCompletion(req, ctx)
 }
 
 func queryBeforeCursor(req Request) string {
@@ -61,13 +73,13 @@ func queryBeforeCursor(req Request) string {
 
 // --- SQL operator completion (WHERE col |, UPDATE SET col |) ---
 
-func sqlOperatorCompletion(req Request) *Result {
+func sqlOperatorCompletion(req Request, ctx sqlContext) *Result {
 	query := []rune(req.Query)
 	start, end := TokenBounds(query, req.Cursor)
 	beforeToken := strings.ToLower(string(query[:start]))
 	prefix := strings.ToLower(TokenValue(query[start:end]))
 
-	if !InWhereClause(beforeToken) && !InUpdateSetList(beforeToken) && !InHavingClause(beforeToken) {
+	if ctx.kind != sqlCtxPredicateOperator {
 		return nil
 	}
 	if prefix != "" {
@@ -93,7 +105,7 @@ func sqlOperatorCompletion(req Request) *Result {
 
 // --- SQL column completion (SELECT cols, WHERE col, ORDER BY, etc.) ---
 
-func sqlColumnCompletion(req Request) *Result {
+func sqlColumnCompletion(req Request, ctx sqlContext) *Result {
 	query := []rune(req.Query)
 	start, end := TokenBounds(query, req.Cursor)
 	// Include * in the replacement range so SELECT * → SELECT col1, col2
@@ -105,36 +117,40 @@ func sqlColumnCompletion(req Request) *Result {
 		start = req.Cursor - 1
 		cursorOnStar = true
 	}
-	beforeToken := strings.ToLower(string(query[:start]))
+	beforeToken := normalizeWhitespace(strings.ToLower(string(query[:start])))
 	trimmed := strings.TrimSpace(beforeToken)
 
 	type colCtx struct {
-		title        string
-		multi        bool
-		includeStar  bool
-		filterSuffix string
+		title       string
+		multi       bool
+		includeStar bool
 	}
 
-	var ctx colCtx
-	switch {
-	case InSelectList(beforeToken):
-		ctx = colCtx{title: "Select Columns", multi: true, includeStar: !cursorOnStar}
-	case InWhereClause(beforeToken):
-		ctx = colCtx{title: "Filter Column", filterSuffix: " = ''"}
-	case InHavingClause(beforeToken):
-		ctx = colCtx{title: "Having Column", filterSuffix: " = ''"}
-	case InOrderByList(beforeToken):
-		if OrderByWantsDirection(beforeToken) {
+	var colContext colCtx
+	switch ctx.kind {
+	case sqlCtxSelectList:
+		colContext = colCtx{title: "Select Columns", multi: true, includeStar: !cursorOnStar}
+	case sqlCtxPredicateColumn:
+		if LastKeyword(beforeToken, " having ") >= 0 {
+			colContext = colCtx{title: "Having Column"}
+		} else {
+			colContext = colCtx{title: "Filter Column"}
+		}
+	case sqlCtxOrderByList:
+		if wantsOrderByDirection(beforeToken) {
 			return nil
 		}
-		ctx = colCtx{title: "Order By Columns", multi: true}
-	case InGroupByList(beforeToken):
-		ctx = colCtx{title: "Group By Columns", multi: true}
-	case InInsertColumnList(beforeToken):
-		ctx = colCtx{title: "Insert Columns", multi: true}
-	case InUpdateSetList(beforeToken):
-		ctx = colCtx{title: "Set Columns"}
-	case trimmed == "":
+		colContext = colCtx{title: "Order By Columns", multi: true}
+	case sqlCtxGroupByList:
+		colContext = colCtx{title: "Group By Columns", multi: true}
+	case sqlCtxInsertColumnList:
+		colContext = colCtx{title: "Insert Columns", multi: true}
+	case sqlCtxUpdateSetList:
+		colContext = colCtx{title: "Set Columns"}
+	case sqlCtxNone:
+		if trimmed == "" {
+			return nil
+		}
 		return nil
 	default:
 		return nil
@@ -144,7 +160,7 @@ func sqlColumnCompletion(req Request) *Result {
 	aliasPrefix := extractAliasPrefix(string(query[start:end]))
 
 	// Build column items from schema
-	items := sqlColumnItems(req, ctx.includeStar, aliasPrefix, prefix)
+	items := sqlColumnItems(req, colContext.includeStar, aliasPrefix, prefix)
 
 	// Signal a schema load if we have no real columns (only * or empty)
 	var needSchema string
@@ -166,10 +182,10 @@ func sqlColumnCompletion(req Request) *Result {
 
 	return &Result{
 		Items:      items,
-		Title:      ctx.title,
+		Title:      colContext.title,
 		Start:      start,
 		End:        end,
-		Multi:      ctx.multi,
+		Multi:      colContext.multi,
 		Fallback:   TokenValue(query[start:end]),
 		NeedSchema: needSchema,
 	}
@@ -225,22 +241,21 @@ func extractAliasPrefix(token string) string {
 
 // --- SQL table completion (FROM, JOIN, UPDATE, INSERT INTO, DELETE FROM) ---
 
-func sqlTableCompletion(req Request) *Result {
+func sqlTableCompletion(req Request, ctx sqlContext) *Result {
 	query := []rune(req.Query)
 	start, end := TokenBounds(query, req.Cursor)
-	beforeToken := strings.ToLower(string(query[:start]))
 
 	var title string
-	switch {
-	case InFromTable(beforeToken):
+	switch ctx.kind {
+	case sqlCtxFromTable:
 		title = "From Table"
-	case InJoinTable(beforeToken):
+	case sqlCtxJoinTable:
 		title = "Join Table"
-	case InUpdateTable(beforeToken):
+	case sqlCtxUpdateTable:
 		title = "Update Table"
-	case InInsertIntoTable(beforeToken):
+	case sqlCtxInsertIntoTable:
 		title = "Insert Into"
-	case InDeleteFromTable(beforeToken):
+	case sqlCtxDeleteFromTable:
 		title = "Delete From"
 	default:
 		return nil
@@ -315,7 +330,6 @@ func sqlValueCompletion(req Request) *Result {
 		Start:      openIdx + 1,
 		End:        req.Cursor,
 		Fallback:   prefix,
-		ValueMode:  true,
 		ValueCol:   col,
 		ValueTable: table,
 		NeedValues: needValues,
@@ -324,13 +338,12 @@ func sqlValueCompletion(req Request) *Result {
 
 // --- SQL clause value completion (LIMIT N, ORDER BY col ASC/DESC) ---
 
-func sqlClauseValueCompletion(req Request) *Result {
+func sqlClauseValueCompletion(req Request, ctx sqlContext) *Result {
 	query := []rune(req.Query)
 	start, end := TokenBounds(query, req.Cursor)
-	beforeToken := strings.ToLower(string(query[:start]))
 	prefix := strings.ToLower(TokenValue(query[start:end]))
 
-	if InLimitValue(beforeToken) {
+	if ctx.kind == sqlCtxLimitValue {
 		items := []Item{
 			{Label: "10", Detail: "limit", InsertText: "10"},
 			{Label: "20", Detail: "limit", InsertText: "20"},
@@ -349,7 +362,7 @@ func sqlClauseValueCompletion(req Request) *Result {
 		}
 	}
 
-	if OrderByWantsDirection(beforeToken) {
+	if ctx.kind == sqlCtxOrderDirection {
 		items := []Item{
 			{Label: "ASC", Detail: "direction", InsertText: "ASC"},
 			{Label: "DESC", Detail: "direction", InsertText: "DESC"},
@@ -368,7 +381,7 @@ func sqlClauseValueCompletion(req Request) *Result {
 
 // --- SQL keyword / starter completion ---
 
-func sqlKeywordCompletion(req Request) *Result {
+func sqlKeywordCompletion(req Request, ctx sqlContext) *Result {
 	query := []rune(req.Query)
 	start, end := TokenBounds(query, req.Cursor)
 	token := strings.ToLower(TokenValue(query[start:end]))
@@ -395,7 +408,7 @@ func sqlKeywordCompletion(req Request) *Result {
 		title = "SQL Clauses"
 	}
 
-	items := sqlKeywordItems(req)
+	items := sqlKeywordItems(req, ctx)
 	if trimmed == "" {
 		for _, name := range req.Tables {
 			items = append(items, Item{
@@ -420,27 +433,25 @@ func sqlKeywordCompletion(req Request) *Result {
 	}
 }
 
-func sqlKeywordItems(req Request) []Item {
+func sqlKeywordItems(req Request, ctx sqlContext) []Item {
 	table := fallbackName(effectiveTable(req), "table_name")
 	filterCol := fallbackName(preferredFilterColumn(req.Schema), "column_name")
-	sortCol := fallbackName(preferredSortColumn(req.Schema), "column_name")
-	before := strings.ToLower(queryBeforeCursor(req))
-	q := QuoteIdentifier
+	before := normalizeWhitespace(strings.ToLower(queryBeforeCursor(req)))
 	trimmed := strings.TrimSpace(before)
 
 	// If there's existing query content, show only contextual next-clause items
 	if trimmed != "" {
 		var items []Item
 
-		if InSelectList(before) || InHavingClause(before) {
+		if ctx.kind == sqlCtxSelectList || LastKeyword(before, " having ") >= 0 {
 			items = append(items,
 				Item{Label: "COUNT(*)", Detail: "aggregate", InsertText: "COUNT(*)"},
-				Item{Label: "COUNT(col)", Detail: "aggregate", InsertText: fmt.Sprintf("COUNT(%s)", q(req.DBType, filterCol))},
-				Item{Label: "SUM(col)", Detail: "aggregate", InsertText: fmt.Sprintf("SUM(%s)", q(req.DBType, filterCol))},
-				Item{Label: "AVG(col)", Detail: "aggregate", InsertText: fmt.Sprintf("AVG(%s)", q(req.DBType, filterCol))},
-				Item{Label: "MIN(col)", Detail: "aggregate", InsertText: fmt.Sprintf("MIN(%s)", q(req.DBType, sortCol))},
-				Item{Label: "MAX(col)", Detail: "aggregate", InsertText: fmt.Sprintf("MAX(%s)", q(req.DBType, sortCol))},
-				Item{Label: "DISTINCT col", Detail: "modifier", InsertText: fmt.Sprintf("DISTINCT %s", q(req.DBType, filterCol))},
+				Item{Label: "COUNT", Detail: "aggregate", InsertText: "COUNT("},
+				Item{Label: "SUM", Detail: "aggregate", InsertText: "SUM("},
+				Item{Label: "AVG", Detail: "aggregate", InsertText: "AVG("},
+				Item{Label: "MIN", Detail: "aggregate", InsertText: "MIN("},
+				Item{Label: "MAX", Detail: "aggregate", InsertText: "MAX("},
+				Item{Label: "DISTINCT", Detail: "modifier", InsertText: "DISTINCT"},
 			)
 		}
 
@@ -452,32 +463,34 @@ func sqlKeywordItems(req Request) []Item {
 		hasLimit := strings.Contains(trimmed, " limit ")
 
 		if hasFrom && !hasWhere {
-			items = append(items, Item{Label: "WHERE", Detail: "clause", InsertText: fmt.Sprintf("\nWHERE %s = ''", q(req.DBType, filterCol))})
+			items = append(items, Item{Label: "WHERE", Detail: "clause", InsertText: "WHERE"})
 		}
 		if hasFrom {
-			items = append(items, Item{Label: "JOIN", Detail: "clause", InsertText: fmt.Sprintf("\nJOIN %s ON ", q(req.DBType, table))})
+			items = append(items, Item{Label: "JOIN", Detail: "clause", InsertText: "JOIN"})
 		}
 		if hasFrom && !hasGroup {
-			items = append(items, Item{Label: "GROUP BY", Detail: "clause", InsertText: fmt.Sprintf("\nGROUP BY %s", q(req.DBType, filterCol))})
+			items = append(items, Item{Label: "GROUP BY", Detail: "clause", InsertText: "GROUP BY"})
 		}
 		if hasFrom && !hasOrder {
-			items = append(items, Item{Label: "ORDER BY", Detail: "clause", InsertText: fmt.Sprintf("\nORDER BY %s DESC", q(req.DBType, sortCol))})
+			items = append(items, Item{Label: "ORDER BY", Detail: "clause", InsertText: "ORDER BY"})
 		}
 		if !hasLimit {
-			items = append(items, Item{Label: "LIMIT", Detail: "clause", InsertText: "\nLIMIT 50"})
+			items = append(items, Item{Label: "LIMIT", Detail: "clause", InsertText: "LIMIT"})
 		}
-		items = append(items, Item{Label: "AND", Detail: "keyword", InsertText: "AND"})
-		items = append(items, Item{Label: "OR", Detail: "keyword", InsertText: "OR"})
+		if strings.Contains(trimmed, " where ") || strings.Contains(trimmed, " having ") {
+			items = append(items, Item{Label: "AND", Detail: "keyword", InsertText: "AND"})
+			items = append(items, Item{Label: "OR", Detail: "keyword", InsertText: "OR"})
+		}
 
 		return items
 	}
 
 	// Empty query — show starters
 	return []Item{
-		{Label: "SELECT starter", Detail: "query", InsertText: fmt.Sprintf("SELECT *\nFROM %s\nLIMIT 50;", q(req.DBType, table))},
-		{Label: "INSERT starter", Detail: "query", InsertText: fmt.Sprintf("INSERT INTO %s (%s)\nVALUES ('');", q(req.DBType, table), q(req.DBType, filterCol))},
-		{Label: "UPDATE starter", Detail: "query", InsertText: fmt.Sprintf("UPDATE %s\nSET %s = ''\nWHERE %s = '';", q(req.DBType, table), q(req.DBType, filterCol), q(req.DBType, filterCol))},
-		{Label: "DELETE starter", Detail: "query", InsertText: fmt.Sprintf("DELETE FROM %s\nWHERE %s = '';", q(req.DBType, table), q(req.DBType, filterCol))},
+		{Label: "SELECT starter", Detail: "query", InsertText: fmt.Sprintf("SELECT *\nFROM %s\nLIMIT 50;", QuoteIdentifier(req.DBType, table))},
+		{Label: "INSERT starter", Detail: "query", InsertText: fmt.Sprintf("INSERT INTO %s (%s)\nVALUES ('');", QuoteIdentifier(req.DBType, table), QuoteIdentifier(req.DBType, filterCol))},
+		{Label: "UPDATE starter", Detail: "query", InsertText: fmt.Sprintf("UPDATE %s\nSET %s = ''\nWHERE %s = '';", QuoteIdentifier(req.DBType, table), QuoteIdentifier(req.DBType, filterCol), QuoteIdentifier(req.DBType, filterCol))},
+		{Label: "DELETE starter", Detail: "query", InsertText: fmt.Sprintf("DELETE FROM %s\nWHERE %s = '';", QuoteIdentifier(req.DBType, table), QuoteIdentifier(req.DBType, filterCol))},
 		{Label: "SELECT", Detail: "keyword", InsertText: "SELECT"},
 		{Label: "INSERT INTO", Detail: "keyword", InsertText: "INSERT INTO"},
 		{Label: "UPDATE", Detail: "keyword", InsertText: "UPDATE"},

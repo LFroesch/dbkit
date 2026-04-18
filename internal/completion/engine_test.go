@@ -74,3 +74,140 @@ func TestSQLCompleteRejectsWrongSchema(t *testing.T) {
 		}
 	}
 }
+
+// A partial identifier touching the cursor must show Filter Column
+// (ranked by prefix), not Operator — otherwise tab would overwrite the
+// identifier with "=".
+func TestSQLCompletePredicateIdentifierTouchingCursor(t *testing.T) {
+	schema := &SchemaInfo{Name: "users", Columns: []ColumnInfo{
+		{Name: "id", Type: "int", PrimaryKey: true},
+		{Name: "name", Type: "text"},
+		{Name: "email", Type: "text"},
+	}}
+	cases := []struct {
+		name       string
+		query      string
+		wantTitle  string
+		wantFirst  string
+	}{
+		{"whole identifier at cursor", "select * from users where name", "Filter Column", "name"},
+		{"partial identifier at cursor", "select * from users where nam", "Filter Column", "name"},
+		{"whitespace after identifier", "select * from users where name ", "Operator", "="},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := Request{
+				Query:         tc.query,
+				Cursor:        len(tc.query),
+				DBType:        "sqlite",
+				Tables:        []string{"users"},
+				Schema:        schema,
+				InferredTable: "users",
+			}
+			r := Complete(req)
+			if r == nil {
+				t.Fatalf("expected result, got nil")
+			}
+			if r.Title != tc.wantTitle {
+				t.Fatalf("Title = %q, want %q", r.Title, tc.wantTitle)
+			}
+			if len(r.Items) == 0 || r.Items[0].Label != tc.wantFirst {
+				t.Fatalf("first item = %v, want %q", r.Items, tc.wantFirst)
+			}
+		})
+	}
+}
+
+// Past-operator positions (= != <> <= >= < > ~ LIKE IN IS …) must suppress
+// the column / keyword picker so they don't misfire where a value is
+// expected.
+func TestSQLCompletePastOperatorSuppressed(t *testing.T) {
+	schema := &SchemaInfo{Name: "users", Columns: []ColumnInfo{{Name: "name", Type: "text"}}}
+	queries := []string{
+		"select * from users where name =",
+		"select * from users where name = ",
+		"select * from users where name >= ",
+		"select * from users where name != ",
+		"select * from users where name <> ",
+		"select * from users where name like ",
+		"select * from users where name in ",
+		"select * from users where name is ",
+		"select * from users where name ~ ",
+		"update users set name = ",
+		"select * from users where a = 1 and b = ",
+	}
+	for _, q := range queries {
+		req := Request{
+			Query:         q,
+			Cursor:        len(q),
+			DBType:        "sqlite",
+			Tables:        []string{"users"},
+			Schema:        schema,
+			InferredTable: "users",
+		}
+		if r := Complete(req); r != nil {
+			t.Errorf("Complete(%q) = %+v, want nil (value position)", q, r.Title)
+		}
+	}
+}
+
+// Value-position suppression must not fire once the value literal is closed
+// — next-clause keywords (AND / OR / GROUP BY / …) should still appear.
+func TestSQLCompleteCompletedPredicateShowsClauses(t *testing.T) {
+	schema := &SchemaInfo{Name: "users", Columns: []ColumnInfo{{Name: "name", Type: "text"}}}
+	queries := []string{
+		"select * from users where name = 'x'",
+		"select * from users where name = 'x' ",
+	}
+	for _, q := range queries {
+		req := Request{
+			Query:         q,
+			Cursor:        len(q),
+			DBType:        "sqlite",
+			Tables:        []string{"users"},
+			Schema:        schema,
+			InferredTable: "users",
+		}
+		r := Complete(req)
+		if r == nil {
+			t.Errorf("Complete(%q) returned nil, want clause picker", q)
+			continue
+		}
+		foundAnd := false
+		for _, it := range r.Items {
+			if it.Label == "AND" {
+				foundAnd = true
+				break
+			}
+		}
+		if !foundAnd {
+			t.Errorf("Complete(%q) missing AND in clause picker: %v", q, r.Items)
+		}
+	}
+}
+
+func TestSQLCompleteSuggestsKeywordOnlyForNextClause(t *testing.T) {
+	req := Request{
+		Query:         `SELECT * FROM users `,
+		Cursor:        len(`SELECT * FROM users `),
+		DBType:        "sqlite",
+		Tables:        []string{"users"},
+		InferredTable: "users",
+	}
+	result := Complete(req)
+	if result == nil {
+		t.Fatal("expected result")
+	}
+	foundWhere := false
+	for _, item := range result.Items {
+		if item.Label == "WHERE" {
+			foundWhere = true
+			if item.InsertText != "WHERE" {
+				t.Fatalf("WHERE InsertText = %q, want keyword only", item.InsertText)
+			}
+		}
+	}
+	if !foundWhere {
+		t.Fatalf("expected WHERE suggestion, got %#v", result.Items)
+	}
+}

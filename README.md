@@ -40,6 +40,7 @@ dbkit
 | Key | Action |
 |-----|--------|
 | `1-4` | Switch tabs |
+| `/` | Jump straight to the Query editor |
 | `tab` | Toggle left/right pane focus |
 | `↑` / `↓` | Navigate the focused list/table |
 | `enter` | Connect / select / use |
@@ -53,6 +54,8 @@ dbkit
 | `ctrl+o` | Open recent query history from the editor |
 | `ctrl+y` | Recall the last-run query |
 | `tab` | In Query editor, open or accept autocomplete |
+| `pgup` / `pgdn` | Scroll the Query Reference pane on the Query tab |
+| `home` / `end` | Jump to top/bottom of the Query Reference pane |
 | `ctrl+g` | Generate query with Ollama (natural language) |
 | `ctrl+t` | Open templates while typing in Query editor |
 | `ctrl+e` | Open backend-aware examples while typing in Query editor |
@@ -76,10 +79,17 @@ The Query tab uses a single assistance flow across backends:
 - Completions open contextually while typing (command/table/field/value/limit/sort contexts), and still render as an inline popover under the editor so the query stays visible.
 - Autocomplete stays optional: `tab` accepts the current suggestion, while `enter` keeps editing the query instead of silently taking a completion.
 - Query/editor commands like `ctrl+l`, `ctrl+r`, `ctrl+t`, `ctrl+e`, and history actions still work while the completion popover is visible.
+- `/` is a global "go write a query" key when you are not already typing into an input, so you do not have to navigate by tab number to get back to Query.
 - Query text input is now strictly scoped to the Query tab, so Results navigation/back behavior is not affected by stale editor focus state.
+- The Query Reference pane is scrollable with `pgup` / `pgdn` / `home` / `end`, even while the editor is focused, so longer examples stay usable without changing focus.
+- Query Reference scrolling is wrap-aware, so long reference examples no longer make the bottom of the left pane look clipped or half-hidden on narrower layouts.
+- In SQL, `tab` on an empty editor or on bare `SELECT` opens the same table-first picker flow, then scaffolds `SELECT * FROM ... WHERE ` with the cursor on `*` so you can replace it with columns immediately.
 - SQL completions cover starter queries, aggregate functions (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT`), and `SELECT` / `FROM` / `JOIN` / `WHERE` / `GROUP BY` / `ORDER BY` / `LIMIT` / `INSERT` / `UPDATE` / `DELETE` contexts.
-- SQL filter building now suggests operators after a selected column, including comparisons, `LIKE`, `IN`, `IS NULL`, and `IS NOT NULL`.
-- SQL value completions fetch distinct sample values after comparison operators (for example `col = '`, `col LIKE '`, `col IN ('`), with substring-aware matching so inputs like `@gmail` rank relevant email values.
+- SQL completion is token-first once a query already has content: `tab` prefers the next small unit (`WHERE`, a column, an operator, `ASC`/`DESC`, a limit number) instead of dropping in a larger clause body.
+- SQL filter building now suggests operators after a selected column, including comparisons, `LIKE`, `IN`, `IS NULL`, and `IS NOT NULL`; bare comparison operators no longer inject placeholder `0` literals that can corrupt timestamp/date filters.
+- SQL value completions fetch distinct sample values after comparison operators (for example `col = '`, `col LIKE '`, `col IN ('`), with substring-aware matching so inputs like `@gmail` rank relevant email values; editing stays in the query itself while the suggestions refresh around it.
+- Closing a quoted SQL value literal does not immediately reopen generic completion, so finishing a sampled timestamp/string stays quiet until you keep typing the next clause.
+- Displayed SQL timestamps now trim useless trailing fractional zero padding for readability, but raw copied/exported values stay unchanged.
 - Mongo completions now guide command -> collection -> arguments, including filter/sort JSON field hints, top-level operators like `$or` / `$and`, nested comparison operators like `$gt`, and on-demand sampled value suggestions for field values.
 - When replacing a nested Mongo operator inside an existing field object (for example `$regex` -> `$in`), autocomplete now preserves the current value text and reshapes it when needed instead of rebuilding the whole object.
 - If you change collections inside the same query (for example `db.users.find(...)` to `db.comments.find(...)`), filter/value completions follow the new collection context.
@@ -87,13 +97,16 @@ The Query tab uses a single assistance flow across backends:
 - In Mongo bool-like value positions, autocomplete now proposes `true` / `false` / `null` immediately (before sample-value queries finish).
 - Mongo typed completion also provides starter literals for complex types (`objectId`, `date/time`, arrays, objects/maps/documents) using Extended JSON where applicable.
 - Accepting built-in command completions inserts minimal literal starters like `db.users.find({})` or `SELECT * FROM ... LIMIT 50;`, and templates load into the editor as plain text.
-- While the completion picker is open, `←` / `→` / `home` / `end` still edit cursor position; in value-filter mode they edit the filter input cursor, and otherwise they move the query-editor cursor.
+- SQL is currently optimized for single-table autocomplete flows first; joins, aliases, and more advanced nested-query cases are intentionally more conservative than Mongo's JSON-aware completion path.
+- While the completion picker is open, `←` / `→` / `home` / `end` still edit cursor position in the query editor instead of switching to a separate filter input.
 - SQL `INSERT ... VALUES (` positions stay free-form instead of opening generic scaffold/keyword completions.
 - Plain Mongo value completion now targets just the current value literal, so accepting a suggestion updates `"@gm"` to `"alice@gmail.com"` without replacing the surrounding `{"email": ...}` object.
 - `ctrl+e` opens backend-aware examples for the current engine so you can quickly recall real query shapes without leaving the editor.
 - `Templates` stay focused on quick actions and now load minimal editable starters; `Examples` stay separate and act as backend-specific reference commands (`read`, `filter`, `sort`, `aggregate`, `write`) so they teach query shape instead of behaving like generated actions.
 
-The footer reflects the current mode — picker-open mode shows `↑/↓ · tab · enter · esc`, edit mode shows the full set of query keybinds including `ctrl+p/n` for inline history cycling.
+History/templates/examples/saved queries all stay overlay-based. Use `ctrl+o`, `ctrl+t`, `ctrl+e`, and `ctrl+u` from the editor, or the single-key shortcuts from the unfocused Query tab.
+
+The footer reflects the current mode — picker-open mode shows `↑/↓ · tab · enter · esc`, while edit mode stays trimmed to the main flow instead of listing every `ctrl+...` chord at once.
 
 ## Supported Databases
 
@@ -101,7 +114,13 @@ The footer reflects the current mode — picker-open mode shows `↑/↓ · tab 
 - **Postgres** — `postgres://user:pass@host:5432/dbname`
 - **MongoDB** — `mongodb://user:pass@host:27017/dbname` — uses standard shell syntax: `db.collection.find({})`, `db.collection.aggregate([...])`, `db.collection.updateOne({},{$set:{}})`, etc. Use `tab` completions, `ctrl+t` templates, `ctrl+e` examples, or `ctrl+g` to generate from natural language via Ollama.
 
-Config saved to `~/.config/dbkit/config.json`. `dbkit` now creates that directory with owner-only access and writes the config file with `0600` permissions because DSNs often contain credentials.
+Config saved to `~/.config/dbkit/config.json`. `dbkit` now creates that directory with owner-only access and writes the config file with `0600` permissions because DSNs often contain credentials. Passwords embedded in DSNs are masked on the Connections detail pane so they don't appear in screenshots or over-the-shoulder views; editing or copying the DSN still yields the full original string.
+
+## Ollama integration (`ctrl+g`)
+
+`ctrl+g` sends a natural-language prompt plus the current schema (table / column names only — never row data) to an Ollama server and inserts the generated query. Host and model are configurable via `DBKIT_OLLAMA_HOST` / `DBKIT_OLLAMA_MODEL` (or `ollama_host` / `ollama_model` in the config file); the default is `http://localhost:11434` with `qwen2.5:7b`.
+
+If you point `DBKIT_OLLAMA_HOST` at a remote (non-localhost) endpoint, be aware that your schema metadata leaves the machine with every generation request. Schema names can themselves be sensitive (e.g. column names like `ssn`, `internal_pricing`), so treat the remote host as a third-party recipient of that information. Keep the default (local Ollama) if that's a concern.
 
 ## License
 
