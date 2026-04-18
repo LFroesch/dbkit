@@ -1,4 +1,4 @@
-module dbkit
+module bobdb
 
 go 1.25.0
 

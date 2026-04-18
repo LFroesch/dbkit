@@ -38,14 +38,17 @@ type Request struct {
 // Result tells the caller what to show in the picker and what async
 // work is needed.
 type Result struct {
-	Items      []Item
-	Title      string
-	Start, End int
-	Fallback   string
-	Multi      bool
-	ValueMode  bool
-	ValueCol   string
-	ValueTable string
+	Items       []Item
+	Title       string
+	Start, End  int
+	Fallback    string
+	Multi       bool
+	MultiPrefix string
+	MultiSuffix string
+	MultiSep    string
+	ValueMode   bool
+	ValueCol    string
+	ValueTable  string
 
 	// NeedSchema is non-empty when the engine needs schema for a table
 	// that isn't in the request. The caller should load it and retry.

@@ -1,5 +1,28 @@
 # Devlog
 
+## 2026-04-18 — rename to `bobdb` with `bob` / `bdb` aliases
+
+- **Product rename**: renamed the app’s canonical product/binary/UI identity from `dbkit` to `bobdb`. Version output, window title, header text, keybind modal copy, module path, build output, and release artifact naming now use `bobdb`.
+- **CLI aliases**: source installs and release installs now create `bob` and `bdb` aliases alongside the canonical `bobdb` binary so users can launch whichever short form they prefer without fragmenting the product name in docs.
+- **Config/env move**: config now lives at `~/.config/bobdb/config.json` and Ollama env vars now use `BOBDB_OLLAMA_HOST` / `BOBDB_OLLAMA_MODEL`.
+- **Docs**: README now documents `bobdb` as the canonical command and calls out `bob` / `bdb` as convenience aliases. Added a short pre-v1 checklist to `WORK.md` for the remaining launch polish.
+- Touched: `go.mod`, `main.go`, `model.go`, `view.go`, `update.go`, `internal/config/config.go`, `internal/ollama/ollama.go`, `Makefile`, `install.sh`, `.github/workflows/release.yml`, `README.md`, `WORK.md`, `DEVLOG.md`.
+
+## 2026-04-18 — Mongo autocomplete cleanup: `findOne` parity and aggregate stages
+
+- **`findOne` parity fixes**: `findOne(...)` now gets the same schema-aware first-argument filter completion as `find(...)`, and collection-switch completion preserves the proper shell method casing (`findOne`, not invalid `findone`) when rebuilding `db.collection.method(...)`.
+- **Aggregate stage completion**: `aggregate([...])` no longer falls back only to two whole-pipeline starter snippets. At stage positions like `db.users.aggregate([` or after a top-level pipeline comma, completion now offers stage-level inserts (`$match`, `$project`, `$group`, `$sort`, `$limit`, etc.) with schema-aware defaults for the common stages.
+- **Tests**: added regression coverage for `findOne` filter completion parity, `findOne` collection-switch rebuilding, and aggregate stage completion/insertion at pipeline-start positions.
+- Touched: `internal/completion/mongo.go`, `model_flow_test.go`, `WORK.md`, `README.md`, `DEVLOG.md`.
+
+## 2026-04-18 — Mongo projection picker for `find` / `findOne`
+
+- **Mongo projection parity**: added a Mongo-native field-selection flow that mirrors the SQL `SELECT *` column picker without inventing SQL-shaped syntax. At the end of a one-argument shell query like `db.users.find({"status":"active"})` or `db.users.findOne({"status":"active"})`, pressing `tab` now opens a multi-select `Project Fields` picker. `space` toggles fields and `tab` inserts the projection argument as an inclusion object such as `{"email":1, "created_at":1}`.
+- **Existing projection re-entry**: if the cursor is already inside `db.users.find({}, {"email":1})`, the same picker reopens against the existing projection object and preserves already-selected fields so edits are reversible instead of destructive. The same completion path now also applies to `findOne(...)`.
+- **Teaching surfaces updated**: Mongo helpers, examples, schema-aware helpers, monitor helpers, and the Query Reference pane now show `find(..., projection)` examples so “select columns” in Mongo is discoverable in the same places SQL exposes column selection.
+- **Tests**: added engine and model-flow coverage for single-arg projection opening, projection insertion, and reopening on existing projection objects.
+- Touched: `internal/completion/mongo.go`, `internal/completion/engine.go`, `model.go`, `update.go`, `view.go`, `model_flow_test.go`, `internal/completion/engine_test.go`, `WORK.md`, `README.md`, `DEVLOG.md`.
+
 ## 2026-04-18 — display polish: wrap-aware Query Reference and timestamp cleanup
 
 - **Wrap-aware Query Reference scrolling**: the Query Reference was still tracking scroll position in terms of source lines, but the left pane can visually wrap long examples into multiple on-screen rows. That mismatch is what made the bottom look clipped or oddly cut off. `view.go` now expands the reference into wrapped display rows for the current pane width and `update.go` scrolls against that rendered row count instead of the raw line count.
@@ -38,7 +61,7 @@
 - **Tests**: `TestMultiLineClauseDetection` in `internal/completion/tokens_test.go` covers newline-prefixed WHERE / AND / ORDER BY / LIMIT / HAVING and the ORDER BY direction edge case. `TestMongoShellWriteRequiresConfirmation` in `model_flow_test.go` covers every shell-syntax write method.
 - **DSN masking**: `renderConnectionDetail` now pipes `conn.DSN` through `maskDSNPassword`, which replaces the password segment (`user:***@host`) on display only. Edit form and `c` (copy DSN) still work against the real string so the user retains full control.
 - **Cleanup**: removed the local `max` in `sql_context.go` (Go 1.25 module; builtin `max` is available).
-- **README**: added a dedicated Ollama section. Schema names (not row data) are transmitted per request, and pointing `DBKIT_OLLAMA_HOST` at a remote endpoint means that metadata leaves the machine — call that out explicitly so users stay on localhost unless they opt in.
+- **README**: added a dedicated Ollama section. Schema names (not row data) are transmitted per request, and pointing `BOBDB_OLLAMA_HOST` at a remote endpoint means that metadata leaves the machine — call that out explicitly so users stay on localhost unless they opt in.
 - Touched: `update.go`, `view.go`, `internal/completion/sql.go`, `internal/completion/sql_context.go`, `internal/completion/tokens_test.go`, `model_flow_test.go`, `README.md`, `WORK.md`, `DEVLOG.md`.
 
 ## 2026-04-16 — SQL token-first completion cleanup
@@ -107,7 +130,7 @@
 - New modal on Query tab (`ctrl+g` focused / `g` unfocused): type a plain-English description, press enter, ollama generates the query. Enter accepts into the editor, `r` retries, esc cancels.
 - Moved Saved Queries picker from `ctrl+g` → `ctrl+u` (focused) and `g` → `u` (unfocused) to free up `ctrl+g` for AI generate.
 - Schema context (table + column names from `schemaCache`) is passed to ollama automatically.
-- Model/host configurable via `DBKIT_OLLAMA_MODEL` / `DBKIT_OLLAMA_HOST` env vars (defaults: `qwen2.5:7b`, `localhost:11434`).
+- Model/host configurable via `BOBDB_OLLAMA_MODEL` / `BOBDB_OLLAMA_HOST` env vars (defaults: `qwen2.5:7b`, `localhost:11434`).
 
 ## 2026-04-15
 
@@ -216,7 +239,7 @@ Root-cause fixes for query completion flow:
 
 ## 2026-04-14
 
-- Simplified the `dbkit` Makefile back to the suite's basic shape (`build` + `install` only, no version ldflags, trimpath, or extra test/vet/clean targets) to keep local iteration lightweight.
+- Simplified the `bobdb` Makefile back to the suite's basic shape (`build` + `install` only, no version ldflags, trimpath, or extra test/vet/clean targets) to keep local iteration lightweight.
 - Synced internal build conventions doc to match the simplified Makefile.
 - Touched: `Makefile`, `CLAUDE.md`, `DEVLOG.md`.
 
@@ -225,7 +248,7 @@ Root-cause fixes for query completion flow:
 - Touched: `internal/db/mongo.go`, `update.go`, `view.go`, `model_flow_test.go`, `README.md`, `DEVLOG.md`.
 
 - Added in-place editing for saved connections from the Connections tab, widened the DSN field for long pasted URIs, and updated the modal copy to make paste-friendly behavior explicit.
-- Hardened config persistence so `dbkit` now writes `~/.config/dbkit/config.json` with owner-only permissions and prefers a non-empty legacy config if an empty XDG config was created during migration.
+- Hardened config persistence so `bobdb` now writes `~/.config/bobdb/config.json` with owner-only permissions and prefers a non-empty legacy config if an empty XDG config was created during migration.
 - Added regression coverage for connection editing and config-permission / legacy-fallback behavior.
 - Touched: `internal/config/config.go`, `internal/config/config_test.go`, `model.go`, `update.go`, `view.go`, `model_flow_test.go`, `WORK.md`, `DEVLOG.md`, `README.md`.
 
@@ -247,7 +270,7 @@ Root-cause fixes for query completion flow:
 - Added a regression test to keep Schema-pane `c` from quietly coming back as a noisy shortcut.
 - Touched: `update.go`, `view.go`, `model_flow_test.go`, `WORK.md`, `DEVLOG.md`, `README.md`.
 
-- Added destructive-action confirmations for saved-connection deletion and write queries so dbkit no longer executes obvious deletes/updates/inserts immediately.
+- Added destructive-action confirmations for saved-connection deletion and write queries so bobdb no longer executes obvious deletes/updates/inserts immediately.
 - Reused the modal overlay flow for confirmations and added regression coverage for confirm-before-delete and confirm-before-run behavior.
 - Touched: `model.go`, `update.go`, `view.go`, `model_flow_test.go`, `WORK.md`, `DEVLOG.md`, `README.md`.
 

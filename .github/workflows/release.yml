@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  BINARY_NAME: dbkit
+  BINARY_NAME: bobdb
   BUILD_TARGET: .
 
 jobs:

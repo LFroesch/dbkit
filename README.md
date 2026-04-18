@@ -1,4 +1,4 @@
-# dbkit
+# bobdb
 
 Database TUI — a dense, keyboard-first database cockpit for SQLite, Postgres, and MongoDB.
 
@@ -9,10 +9,10 @@ Supported platforms: Linux and macOS. On Windows, use WSL.
 Recommended (installs to `~/.local/bin`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LFroesch/dbkit/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/LFroesch/bobdb/main/install.sh | bash
 ```
 
-Or download a binary from [GitHub Releases](https://github.com/LFroesch/dbkit/releases).
+Or download a binary from [GitHub Releases](https://github.com/LFroesch/bobdb/releases).
 
 Or build from source:
 
@@ -20,10 +20,13 @@ Or build from source:
 make install
 ```
 
-Command:
+Commands:
 
 ```bash
-dbkit
+bobdb
+# aliases:
+bob
+bdb
 ```
 
 ## Tabs
@@ -68,7 +71,7 @@ dbkit
 | `q` | Quit |
 | `?` | Help |
 
-On narrower terminals, `dbkit` collapses to a single active pane and `tab` swaps between the navigator and the detail pane.
+On narrower terminals, `bobdb` collapses to a single active pane and `tab` swaps between the navigator and the detail pane.
 Schema fields and query results render inside full-width tables in the detail pane so column alignment stays intact across resize changes.
 
 Saved connections can be edited in place from the Connections tab with `e`.
@@ -91,6 +94,9 @@ The Query tab uses a single assistance flow across backends:
 - Closing a quoted SQL value literal does not immediately reopen generic completion, so finishing a sampled timestamp/string stays quiet until you keep typing the next clause.
 - Displayed SQL timestamps now trim useless trailing fractional zero padding for readability, but raw copied/exported values stay unchanged.
 - Mongo completions now guide command -> collection -> arguments, including filter/sort JSON field hints, top-level operators like `$or` / `$and`, nested comparison operators like `$gt`, and on-demand sampled value suggestions for field values.
+- Mongo `find(...)` and `findOne(...)` now have a projection multi-select flow parallel to SQL column picking: pressing `tab` at the end of `db.collection.find(filter)` or `db.collection.findOne(filter)` opens a field picker, `space` toggles fields, and `tab` inserts the projection argument while keeping Mongo's default `_id` behavior.
+- Mongo `findOne(...)` now gets the same schema-aware filter-field completion as `find(...)`, so the two read commands do not diverge on the first argument.
+- Mongo `aggregate([...])` now opens stage-level completion at pipeline positions such as `aggregate([` or after a stage comma, offering `$match`, `$project`, `$group`, `$sort`, `$limit`, and related stages instead of only a couple of whole-pipeline snippets.
 - When replacing a nested Mongo operator inside an existing field object (for example `$regex` -> `$in`), autocomplete now preserves the current value text and reshapes it when needed instead of rebuilding the whole object.
 - If you change collections inside the same query (for example `db.users.find(...)` to `db.comments.find(...)`), filter/value completions follow the new collection context.
 - Mongo autocomplete now uses typed JSON literals for common scalar types (`bool`, numeric, `null`) so values like `true` are inserted without forced string quotes.
@@ -114,13 +120,13 @@ The footer reflects the current mode — picker-open mode shows `↑/↓ · tab 
 - **Postgres** — `postgres://user:pass@host:5432/dbname`
 - **MongoDB** — `mongodb://user:pass@host:27017/dbname` — uses standard shell syntax: `db.collection.find({})`, `db.collection.aggregate([...])`, `db.collection.updateOne({},{$set:{}})`, etc. Use `tab` completions, `ctrl+t` templates, `ctrl+e` examples, or `ctrl+g` to generate from natural language via Ollama.
 
-Config saved to `~/.config/dbkit/config.json`. `dbkit` now creates that directory with owner-only access and writes the config file with `0600` permissions because DSNs often contain credentials. Passwords embedded in DSNs are masked on the Connections detail pane so they don't appear in screenshots or over-the-shoulder views; editing or copying the DSN still yields the full original string.
+Config saved to `~/.config/bobdb/config.json`. `bobdb` now creates that directory with owner-only access and writes the config file with `0600` permissions because DSNs often contain credentials. Passwords embedded in DSNs are masked on the Connections detail pane so they don't appear in screenshots or over-the-shoulder views; editing or copying the DSN still yields the full original string.
 
 ## Ollama integration (`ctrl+g`)
 
-`ctrl+g` sends a natural-language prompt plus the current schema (table / column names only — never row data) to an Ollama server and inserts the generated query. Host and model are configurable via `DBKIT_OLLAMA_HOST` / `DBKIT_OLLAMA_MODEL` (or `ollama_host` / `ollama_model` in the config file); the default is `http://localhost:11434` with `qwen2.5:7b`.
+`ctrl+g` sends a natural-language prompt plus the current schema (table / column names only — never row data) to an Ollama server and inserts the generated query. Host and model are configurable via `BOBDB_OLLAMA_HOST` / `BOBDB_OLLAMA_MODEL` (or `ollama_host` / `ollama_model` in the config file); the default is `http://localhost:11434` with `qwen2.5:7b`.
 
-If you point `DBKIT_OLLAMA_HOST` at a remote (non-localhost) endpoint, be aware that your schema metadata leaves the machine with every generation request. Schema names can themselves be sensitive (e.g. column names like `ssn`, `internal_pricing`), so treat the remote host as a third-party recipient of that information. Keep the default (local Ollama) if that's a concern.
+If you point `BOBDB_OLLAMA_HOST` at a remote (non-localhost) endpoint, be aware that your schema metadata leaves the machine with every generation request. Schema names can themselves be sensitive (e.g. column names like `ssn`, `internal_pricing`), so treat the remote host as a third-party recipient of that information. Keep the default (local Ollama) if that's a concern.
 
 ## License
 

@@ -10,6 +10,20 @@ import (
 	"unicode"
 )
 
+type mongoProjectionContext struct {
+	start    int
+	end      int
+	prefix   string
+	suffix   string
+	selected map[string]bool
+}
+
+type mongoAggregateStageContext struct {
+	start  int
+	end    int
+	prefix string
+}
+
 // MongoToken represents a parsed token from a Mongo query string.
 type MongoToken struct {
 	Value string
@@ -175,6 +189,7 @@ func MongoCommandItemsForCollection(table string) []Item {
 	}
 	return []Item{
 		{Label: "find", Detail: "query", InsertText: fmt.Sprintf("db.%s.find({})", table)},
+		{Label: "findOne", Detail: "query", InsertText: fmt.Sprintf("db.%s.findOne({})", table)},
 		{Label: "aggregate", Detail: "query", InsertText: fmt.Sprintf("db.%s.aggregate([])", table)},
 		{Label: "insertOne", Detail: "query", InsertText: fmt.Sprintf("db.%s.insertOne({})", table)},
 		{Label: "updateOne", Detail: "query", InsertText: fmt.Sprintf("db.%s.updateOne({},{\"$set\":{}})", table)},
@@ -738,6 +753,10 @@ func mongoComplete(req Request) *Result {
 		command = strings.ToLower(tokens[0].Value)
 	}
 
+	if projection := mongoFindProjectionCompletion(req, isShell, tokens); projection != nil {
+		return projection
+	}
+
 	ctx := &Result{Start: start, End: end, Title: "Mongo Commands", Fallback: strings.TrimSpace(query[start:end])}
 	var items []Item
 
@@ -772,6 +791,21 @@ func mongoComplete(req Request) *Result {
 		ctx.Title = "Mongo Arguments"
 		collection := MongoCollectionFromTokens(tokens)
 		tokenText := strings.TrimSpace(query[start:end])
+		if command == "aggregate" && strings.HasPrefix(tokenText, "[") {
+			if stageCtx, ok := mongoAggregateStagePosition(tokenText, cursor-start); ok {
+				items, needSchema := mongoAggregateStageItems(req, collection)
+				ctx.Title = "Aggregate Stage"
+				ctx.Start = start + stageCtx.start
+				ctx.End = start + stageCtx.end
+				ctx.Fallback = string([]rune(query)[ctx.Start:ctx.End])
+				ctx.NeedSchema = needSchema
+				prefix = stageCtx.prefix
+				ctx.Items = RankItems(prefix, items)
+				if len(ctx.Items) > 0 {
+					return ctx
+				}
+			}
+		}
 		argResult := mongoArgumentItems(req, command, collection, tokenIdx, tokenText, cursor-start)
 		items = argResult.items
 		if argResult.needSchema != "" {
@@ -819,6 +853,142 @@ func mongoComplete(req Request) *Result {
 	return ctx
 }
 
+func mongoFindProjectionCompletion(req Request, isShell bool, tokens []MongoToken) *Result {
+	if !isShell || len(tokens) < 3 {
+		return nil
+	}
+	command := strings.ToLower(tokens[0].Value)
+	if command != "find" && command != "findone" {
+		return nil
+	}
+	ctx, ok := mongoFindProjectionContext(req.Query, req.Cursor, tokens)
+	if !ok {
+		return nil
+	}
+	collection := MongoCollectionFromTokens(tokens)
+	schema := req.Schema
+	if schema != nil && collection != "" && !strings.EqualFold(schema.Name, collection) {
+		schema = nil
+	}
+	fields, _ := schemaFields(schema)
+	items := make([]Item, 0, len(fields))
+	for _, field := range fields {
+		items = append(items, Item{
+			Label:      field,
+			Detail:     "field",
+			InsertText: fmt.Sprintf(`"%s":1`, field),
+			Selected:   ctx.selected[field],
+		})
+	}
+	result := &Result{
+		Items:       items,
+		Title:       "Project Fields",
+		Start:       ctx.start,
+		End:         ctx.end,
+		Multi:       true,
+		MultiPrefix: ctx.prefix,
+		MultiSuffix: ctx.suffix,
+		MultiSep:    ", ",
+	}
+	if len(fields) == 0 && collection != "" && schema == nil {
+		result.NeedSchema = collection
+	}
+	return result
+}
+
+func mongoFindProjectionContext(query string, cursor int, tokens []MongoToken) (mongoProjectionContext, bool) {
+	runes := []rune(query)
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(runes) {
+		cursor = len(runes)
+	}
+	lastParen := -1
+	for i := len(runes) - 1; i >= 0; i-- {
+		if runes[i] == ')' {
+			lastParen = i
+			break
+		}
+	}
+
+	if len(tokens) == 3 {
+		if lastParen < 0 {
+			return mongoProjectionContext{}, false
+		}
+		arg := tokens[2]
+		if cursor < lastParen || cursor > len(runes) {
+			return mongoProjectionContext{}, false
+		}
+		if strings.TrimSpace(string(runes[arg.End:lastParen])) != "" {
+			return mongoProjectionContext{}, false
+		}
+		return mongoProjectionContext{
+			start:  arg.End,
+			end:    arg.End,
+			prefix: ", {",
+			suffix: "}",
+		}, true
+	}
+	if len(tokens) < 4 {
+		return mongoProjectionContext{}, false
+	}
+	if lastParen < 0 {
+		lastParen = len(runes)
+	}
+	projection := tokens[3]
+	start := projection.Start
+	end := projection.End
+	if strings.TrimSpace(projection.Value) == "" {
+		start = projection.Start
+		end = projection.End
+		return mongoProjectionContext{
+			start:  start,
+			end:    end,
+			prefix: "{",
+			suffix: "}",
+		}, cursor >= start && cursor <= lastParen
+	}
+	if !strings.HasPrefix(strings.TrimSpace(projection.Value), "{") {
+		return mongoProjectionContext{}, false
+	}
+	if cursor < start || cursor > end {
+		return mongoProjectionContext{}, false
+	}
+	return mongoProjectionContext{
+		start:    start,
+		end:      end,
+		prefix:   "{",
+		suffix:   "}",
+		selected: mongoProjectionSelections(projection.Value),
+	}, true
+}
+
+func mongoProjectionSelections(raw string) map[string]bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || !strings.HasPrefix(trimmed, "{") {
+		return nil
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+		return nil
+	}
+	selected := make(map[string]bool, len(parsed))
+	for key, value := range parsed {
+		switch v := value.(type) {
+		case bool:
+			if v {
+				selected[key] = true
+			}
+		case float64:
+			if v != 0 {
+				selected[key] = true
+			}
+		}
+	}
+	return selected
+}
+
 func mongoCollectionItems(tables []string) []Item {
 	items := make([]Item, 0, len(tables))
 	for _, name := range tables {
@@ -835,6 +1005,8 @@ func mongoShellCollectionItems(tables []string, method string, tokens []MongoTok
 	switch method {
 	case "find":
 		shellMethod = "find"
+	case "findone":
+		shellMethod = "findOne"
 	case "aggregate":
 		shellMethod = "aggregate"
 	case "insert":
@@ -956,6 +1128,11 @@ func mongoArgumentItems(req Request, command, collection string, tokenIdx int, t
 			}}
 		}
 		return mongoArgResult{items: sortItems(), needSchema: needSchema}
+	case "findone":
+		if tokenIdx == 2 {
+			return mongoArgResult{items: filterItems(), needSchema: needSchema}
+		}
+		return mongoArgResult{needSchema: needSchema}
 	case "aggregate":
 		return mongoArgResult{items: []Item{
 			{Label: "match + limit", Detail: "pipeline", InsertText: fmt.Sprintf(`[{"$match":{"%s":%s}},{"$limit":20}]`, filterField, MongoPlaceholderForType(fieldTypes[filterField]))},
@@ -989,6 +1166,169 @@ func mongoArgumentItems(req Request, command, collection string, tokenIdx int, t
 	default:
 		return mongoArgResult{needSchema: needSchema}
 	}
+}
+
+func mongoAggregateStageItems(req Request, collection string) ([]Item, string) {
+	schema := req.Schema
+	if schema != nil && collection != "" && !strings.EqualFold(schema.Name, collection) {
+		schema = nil
+	}
+	fields, fieldTypes := schemaFields(schema)
+	filterField := fallbackName(preferredFilterColumnFromFields(fields), "column_name")
+	groupField := fallbackName(preferredCategoricalColumnFromFields(fields, fieldTypes), "column_name")
+	var needSchema string
+	if len(fields) == 0 && collection != "" && schema == nil {
+		needSchema = collection
+	}
+	items := MongoAggregationStageItems()
+	if len(fields) == 0 {
+		return items, needSchema
+	}
+	out := make([]Item, 0, len(items))
+	for _, item := range items {
+		switch item.Label {
+		case "$match":
+			item.InsertText = fmt.Sprintf(`{"$match":{"%s":%s}}`, filterField, MongoPlaceholderForType(fieldTypes[filterField]))
+		case "$project":
+			item.InsertText = fmt.Sprintf(`{"$project":{"%s":1,"%s":1}}`, filterField, groupField)
+		case "$group":
+			item.InsertText = fmt.Sprintf(`{"$group":{"_id":"$%s","count":{"$sum":1}}}`, groupField)
+		case "$sort":
+			item.InsertText = fmt.Sprintf(`{"$sort":{"%s":-1}}`, groupField)
+		}
+		out = append(out, item)
+	}
+	return out, needSchema
+}
+
+func mongoAggregateStagePosition(token string, cursor int) (mongoAggregateStageContext, bool) {
+	runes := []rune(token)
+	if len(runes) == 0 || runes[0] != '[' {
+		return mongoAggregateStageContext{}, false
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(runes) {
+		cursor = len(runes)
+	}
+
+	depthBrace := 0
+	depthBracket := 0
+	inQuote := false
+	escape := false
+	stageStart := -1
+	for i := 0; i < cursor; i++ {
+		ch := runes[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if inQuote {
+			if ch == '\\' {
+				escape = true
+				continue
+			}
+			if ch == '"' {
+				inQuote = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inQuote = true
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+			if depthBracket == 1 && depthBrace == 1 && stageStart < 0 {
+				stageStart = i
+			}
+		case '}':
+			if depthBracket == 1 && depthBrace == 1 {
+				stageStart = -1
+			}
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case ',':
+			if depthBracket == 1 && depthBrace == 0 {
+				stageStart = -1
+			}
+		}
+	}
+
+	start := cursor
+	for start > 0 && unicode.IsSpace(runes[start-1]) {
+		start--
+	}
+	for start > 0 {
+		prev := runes[start-1]
+		if prev == '[' || prev == ',' {
+			break
+		}
+		if !unicode.IsSpace(prev) {
+			if stageStart >= 0 {
+				start = stageStart
+			} else {
+				return mongoAggregateStageContext{}, false
+			}
+			break
+		}
+		start--
+	}
+
+	end := cursor
+	depthBrace = 0
+	depthBracket = 0
+	inQuote = false
+	escape = false
+	for end < len(runes) {
+		ch := runes[end]
+		if escape {
+			escape = false
+			end++
+			continue
+		}
+		if inQuote {
+			if ch == '\\' {
+				escape = true
+			} else if ch == '"' {
+				inQuote = false
+			}
+			end++
+			continue
+		}
+		switch ch {
+		case '"':
+			inQuote = true
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket == 0 && depthBrace == 0 {
+				return mongoAggregateStageContext{start: start, end: end, prefix: strings.ToLower(strings.Trim(strings.TrimSpace(string(runes[start:end])), `"{`))}, true
+			}
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case ',':
+			if depthBrace == 0 && depthBracket == 0 {
+				return mongoAggregateStageContext{start: start, end: end, prefix: strings.ToLower(strings.Trim(strings.TrimSpace(string(runes[start:end])), `"{`))}, true
+			}
+		}
+		end++
+	}
+	return mongoAggregateStageContext{start: start, end: end, prefix: strings.ToLower(strings.Trim(strings.TrimSpace(string(runes[start:end])), `"{`))}, true
 }
 
 func mongoJSONValueItems(req Request, collection string, _ []string, fieldTypes map[string]string, token string, cursor int) ([]Item, *ValueRequest) {

@@ -54,6 +54,91 @@ func TestMongoCompleteUsesCorrectSchema(t *testing.T) {
 	}
 }
 
+func TestMongoCompleteFindProjectionPickerAtSingleArgEnd(t *testing.T) {
+	req := Request{
+		Query:  `db.users.find({"status":"active"})`,
+		Cursor: len(`db.users.find({"status":"active"})`),
+		DBType: "mongo",
+		Tables: []string{"users"},
+		Schema: &SchemaInfo{Name: "users", Columns: []ColumnInfo{
+			{Name: "status", Type: "string"},
+			{Name: "email", Type: "string"},
+			{Name: "created_at", Type: "timestamp"},
+		}},
+		InferredTable: "users",
+	}
+	result := Complete(req)
+	if result == nil {
+		t.Fatal("expected result")
+	}
+	if result.Title != "Project Fields" {
+		t.Fatalf("Title = %q, want Project Fields", result.Title)
+	}
+	if !result.Multi || result.MultiPrefix != ", {" || result.MultiSuffix != "}" {
+		t.Fatalf("unexpected projection multi config: %+v", result)
+	}
+	if len(result.Items) == 0 || result.Items[0].Detail != "field" {
+		t.Fatalf("expected field items, got %#v", result.Items)
+	}
+}
+
+func TestMongoCompleteFindProjectionPreservesSelectedFields(t *testing.T) {
+	req := Request{
+		Query:  `db.users.find({}, {"email":1,"created_at":1})`,
+		Cursor: len(`db.users.find({}, {"email":1`),
+		DBType: "mongo",
+		Tables: []string{"users"},
+		Schema: &SchemaInfo{Name: "users", Columns: []ColumnInfo{
+			{Name: "email", Type: "string"},
+			{Name: "created_at", Type: "timestamp"},
+			{Name: "status", Type: "string"},
+		}},
+		InferredTable: "users",
+	}
+	result := Complete(req)
+	if result == nil {
+		t.Fatal("expected result")
+	}
+	if result.Title != "Project Fields" {
+		t.Fatalf("Title = %q, want Project Fields", result.Title)
+	}
+	selected := map[string]bool{}
+	for _, item := range result.Items {
+		selected[item.Label] = item.Selected
+	}
+	if !selected["email"] || !selected["created_at"] {
+		t.Fatalf("expected existing projection selections to be preserved, got %#v", result.Items)
+	}
+	if selected["status"] {
+		t.Fatalf("status should not be preselected, got %#v", result.Items)
+	}
+}
+
+func TestMongoCompleteFindOneProjectionPickerAtSingleArgEnd(t *testing.T) {
+	req := Request{
+		Query:  `db.users.findOne({"status":"active"})`,
+		Cursor: len(`db.users.findOne({"status":"active"})`),
+		DBType: "mongo",
+		Tables: []string{"users"},
+		Schema: &SchemaInfo{Name: "users", Columns: []ColumnInfo{
+			{Name: "status", Type: "string"},
+			{Name: "email", Type: "string"},
+			{Name: "created_at", Type: "timestamp"},
+		}},
+		InferredTable: "users",
+	}
+	result := Complete(req)
+	if result == nil {
+		t.Fatal("expected result")
+	}
+	if result.Title != "Project Fields" {
+		t.Fatalf("Title = %q, want Project Fields", result.Title)
+	}
+	if !result.Multi || result.MultiPrefix != ", {" || result.MultiSuffix != "}" {
+		t.Fatalf("unexpected projection multi config: %+v", result)
+	}
+}
+
 func TestSQLCompleteRejectsWrongSchema(t *testing.T) {
 	req := Request{
 		Query:         `SELECT * FROM orders WHERE `,
@@ -85,10 +170,10 @@ func TestSQLCompletePredicateIdentifierTouchingCursor(t *testing.T) {
 		{Name: "email", Type: "text"},
 	}}
 	cases := []struct {
-		name       string
-		query      string
-		wantTitle  string
-		wantFirst  string
+		name      string
+		query     string
+		wantTitle string
+		wantFirst string
 	}{
 		{"whole identifier at cursor", "select * from users where name", "Filter Column", "name"},
 		{"partial identifier at cursor", "select * from users where nam", "Filter Column", "name"},

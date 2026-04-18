@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="LFroesch/dbkit"
-BINARY_NAME="dbkit"
+REPO="LFroesch/bobdb"
+BINARY_NAME="bobdb"
+ALIASES=("bob" "bdb")
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
 error() {
@@ -91,8 +92,12 @@ main() {
 
   mkdir -p "$INSTALL_DIR"
   install -m 0755 "$tmp_bin" "$INSTALL_DIR/$BINARY_NAME"
+  for alias in "${ALIASES[@]}"; do
+    ln -sf "$BINARY_NAME" "$INSTALL_DIR/$alias"
+  done
 
   echo "Installed $BINARY_NAME to $INSTALL_DIR/$BINARY_NAME"
+  echo "Aliases: ${ALIASES[*]}"
   if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
     warn "$INSTALL_DIR is not in PATH"
     warn "Add this to your shell config: export PATH=\"$PATH:$INSTALL_DIR\""

@@ -6,14 +6,14 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"dbkit/internal/config"
+	"bobdb/internal/config"
 )
 
 var version = "dev"
 
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
-		fmt.Println("dbkit " + version)
+		fmt.Println("bobdb " + version)
 		return
 	}
 

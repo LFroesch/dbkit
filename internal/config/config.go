@@ -37,12 +37,12 @@ const (
 
 func configPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "dbkit", "config.json")
+	return filepath.Join(home, ".config", "bobdb", "config.json")
 }
 
 func legacyConfigPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".dbkit", "config.json")
+	return filepath.Join(home, ".bobdb", "config.json")
 }
 
 // Load reads config from disk. Returns empty config if not found.
@@ -54,7 +54,6 @@ func Load() (*Config, error) {
 			return nil, err
 		}
 
-		// Backward compatibility: read from pre-XDG location if present.
 		legacyPath := legacyConfigPath()
 		data, err = os.ReadFile(legacyPath)
 		if err != nil {

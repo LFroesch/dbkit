@@ -10,7 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/lipgloss"
 
-	"dbkit/internal/db"
+	"bobdb/internal/db"
 )
 
 var fractionalTimestampPattern = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\.(\d+)(.*)$`)
@@ -72,7 +72,7 @@ func (m Model) renderDialogPage(dialog string) string {
 }
 
 func (m Model) renderHeader() string {
-	title := titleStyle.Render("dbkit")
+	title := titleStyle.Render("bobdb")
 
 	var tabs []string
 	for i, current := range primaryTabs {
@@ -422,6 +422,8 @@ func (m Model) queryReferenceEntries() []queryReferenceEntry {
 		lines = append(lines,
 			section("Read"),
 			ex(`db.posts.find({})`),
+			ex(`db.posts.find({}, {"title":1, "author_id":1})`),
+			ex(`db.posts.findOne({"status":"published"}, {"title":1, "author_id":1})`),
 			ex(`db.posts.find({"status":"published"})`),
 			ex(`db.posts.find({"created_at":{"$gte":{"$date":"2026-04-09T00:00:00Z"}}})`),
 			ex(`db.posts.find({}).sort({"created_at":-1}).limit(50)`),
@@ -926,7 +928,7 @@ func (m Model) renderNewConnModal() string {
 
 func (m Model) renderHelpModal() string {
 	lines := []string{
-		panelHeaderStyle.Render("dbkit keybinds"),
+		panelHeaderStyle.Render("bobdb keybinds"),
 		"",
 		keyStyle.Render("1-4") + " " + actionStyle.Render("switch tabs"),
 		keyStyle.Render("tab") + " " + actionStyle.Render("toggle left/right pane"),

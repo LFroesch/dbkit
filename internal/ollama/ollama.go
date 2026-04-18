@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"dbkit/internal/config"
+	"bobdb/internal/config"
 )
 
 const defaultHost = "http://localhost:11434"
@@ -24,7 +24,7 @@ type Client struct {
 func New() *Client {
 	cfg, _ := config.Load()
 
-	host := os.Getenv("DBKIT_OLLAMA_HOST")
+	host := os.Getenv("BOBDB_OLLAMA_HOST")
 	if host == "" {
 		host = os.Getenv("OLLAMA_HOST")
 	}
@@ -38,7 +38,7 @@ func New() *Client {
 		host = "http://" + host
 	}
 
-	model := os.Getenv("DBKIT_OLLAMA_MODEL")
+	model := os.Getenv("BOBDB_OLLAMA_MODEL")
 	if model == "" && cfg != nil {
 		model = cfg.OllamaModel
 	}

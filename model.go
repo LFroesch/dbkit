@@ -8,9 +8,9 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"dbkit/internal/completion"
-	"dbkit/internal/config"
-	"dbkit/internal/db"
+	"bobdb/internal/completion"
+	"bobdb/internal/config"
+	"bobdb/internal/db"
 )
 
 type tab int
@@ -215,15 +215,18 @@ type Model struct {
 	queryPickerItems  []queryPickerItem
 	queryPickerCursor int
 	// Modal overlay: column picker
-	showColumnPicker       bool
-	columnPickerTitle      string
-	columnPickerItems      []completion.Item
-	columnPickerCursor     int
-	columnPickerMulti      bool
-	columnPickerStart      int
-	columnPickerEnd        int
-	columnPickerFallback   string
-	columnPickerTableFirst bool // table-first flow: selecting scaffolds SELECT * FROM <table>
+	showColumnPicker        bool
+	columnPickerTitle       string
+	columnPickerItems       []completion.Item
+	columnPickerCursor      int
+	columnPickerMulti       bool
+	columnPickerMultiPrefix string
+	columnPickerMultiSuffix string
+	columnPickerMultiSep    string
+	columnPickerStart       int
+	columnPickerEnd         int
+	columnPickerFallback    string
+	columnPickerTableFirst  bool // table-first flow: selecting scaffolds SELECT * FROM <table>
 	// Value-completion mode: typing filters the list without inserting into the query.
 	columnPickerValueMode   bool
 	columnPickerValuePrefix string
@@ -310,5 +313,5 @@ func newModel(cfg *config.Config) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.SetWindowTitle("dbkit")
+	return tea.SetWindowTitle("bobdb")
 }

@@ -17,10 +17,10 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"dbkit/internal/completion"
-	"dbkit/internal/config"
-	"dbkit/internal/db"
-	"dbkit/internal/ollama"
+	"bobdb/internal/completion"
+	"bobdb/internal/config"
+	"bobdb/internal/db"
+	"bobdb/internal/ollama"
 )
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -808,6 +808,8 @@ var sqliteQueryHelpers = []queryHelper{
 var mongoQueryHelpers = []queryHelper{
 	{label: "List collections", template: `collections`},
 	{label: "Find all (first 100)", template: `db.{table}.find({})`},
+	{label: "Find with projection", template: `db.{table}.find({}, {"name":1, "email":1})`},
+	{label: "Find one with projection", template: `db.{table}.findOne({}, {"name":1, "email":1})`},
 	{label: "Find with filter", template: `db.{table}.find({"status":"active"})`},
 	{label: "Find by _id (ObjectID)", template: `db.{table}.findOne({"_id":{"$oid":"000000000000000000000000"}})`},
 	{label: "Count all", template: `db.{table}.countDocuments({})`},
@@ -845,6 +847,8 @@ var sqliteQueryExamples = []queryHelper{
 
 var mongoQueryExamples = []queryHelper{
 	{label: "Read: find top documents", template: `db.{table}.find({})`},
+	{label: "Read: project selected fields", template: `db.{table}.find({}, {"name":1, "email":1})`},
+	{label: "Read: findOne projected document", template: `db.{table}.findOne({"status":"active"}, {"name":1, "email":1})`},
 	{label: "Filter: exact field match", template: `db.{table}.find({"status":"active"})`},
 	{label: "Filter: nested operator", template: `db.{table}.find({"age":{"$gte":18}})`},
 	{label: "Filter: regex", template: `db.{table}.find({"email":{"$regex":"@example.com"}})`},
@@ -2541,6 +2545,9 @@ func (m *Model) openCompletionForCursor(manual bool) (bool, tea.Cmd) {
 	m.columnPickerItems = result.Items
 	m.columnPickerCursor = 0
 	m.columnPickerMulti = result.Multi
+	m.columnPickerMultiPrefix = result.MultiPrefix
+	m.columnPickerMultiSuffix = result.MultiSuffix
+	m.columnPickerMultiSep = result.MultiSep
 	m.columnPickerStart = result.Start
 	m.columnPickerEnd = result.End
 	m.columnPickerFallback = result.Fallback
@@ -2569,6 +2576,9 @@ func (m *Model) openTableFirstPicker() {
 	m.columnPickerItems = items
 	m.columnPickerCursor = 0
 	m.columnPickerMulti = false
+	m.columnPickerMultiPrefix = ""
+	m.columnPickerMultiSuffix = ""
+	m.columnPickerMultiSep = ""
 	m.columnPickerStart = 0
 	m.columnPickerEnd = 0
 	m.columnPickerFallback = ""
@@ -2609,7 +2619,10 @@ func (m *Model) refreshCompletionPicker(manual bool) (bool, tea.Cmd) {
 	m.columnPickerTitle = result.Title
 	m.columnPickerItems = result.Items
 	m.columnPickerCursor = 0
-	m.columnPickerMulti = false
+	m.columnPickerMulti = result.Multi
+	m.columnPickerMultiPrefix = result.MultiPrefix
+	m.columnPickerMultiSuffix = result.MultiSuffix
+	m.columnPickerMultiSep = result.MultiSep
 	m.columnPickerStart = result.Start
 	m.columnPickerEnd = result.End
 	m.columnPickerFallback = result.Fallback
@@ -2664,9 +2677,15 @@ func (m *Model) applyCompletionInsertion(start, end int, fallback string, multi 
 		}
 		parts = append(parts, insertText)
 	}
-	insert := strings.Join(parts, ", ")
+	sep := ", "
+	if m.columnPickerMultiSep != "" {
+		sep = m.columnPickerMultiSep
+	}
+	insert := strings.Join(parts, sep)
 	if !multi && len(parts) == 1 {
 		insert = parts[0]
+	} else if multi {
+		insert = m.columnPickerMultiPrefix + insert + m.columnPickerMultiSuffix
 	}
 	query := []rune(m.queryInput.Value())
 	if start < 0 || start > len(query) {
@@ -2847,6 +2866,9 @@ func (m Model) updateColumnPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showColumnPicker = false
 		m.columnPickerTableFirst = false
 		m.columnPickerValueMode = false
+		m.columnPickerMultiPrefix = ""
+		m.columnPickerMultiSuffix = ""
+		m.columnPickerMultiSep = ""
 		m.columnPickerValuePrefix = ""
 		m.columnPickerValueCursor = 0
 		return m, nil
@@ -2902,6 +2924,9 @@ func (m Model) updateColumnPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.columnPickerValuePrefix = ""
 		m.columnPickerValueCursor = 0
 		m.applyCompletionInsertion(m.columnPickerStart, m.columnPickerEnd, m.columnPickerFallback, m.columnPickerMulti, items)
+		m.columnPickerMultiPrefix = ""
+		m.columnPickerMultiSuffix = ""
+		m.columnPickerMultiSep = ""
 		if !valueMode {
 			m.setStatus("inserted completion")
 		}
@@ -3384,6 +3409,8 @@ func (m Model) schemaAwareHelpers(table string) []queryHelper {
 		}
 		items = append(items,
 			queryHelper{label: "Find using schema fields", template: fmt.Sprintf("db.%s.find({})", table)},
+			queryHelper{label: "Project top schema fields", template: fmt.Sprintf(`db.%s.find({}, {"%s":1, "%s":1})`, table, lookupField, groupField)},
+			queryHelper{label: "Find one projected document", template: fmt.Sprintf(`db.%s.findOne({"%s":"value"}, {"%s":1, "%s":1})`, table, lookupField, lookupField, groupField)},
 			queryHelper{label: "Lookup by key field", template: fmt.Sprintf(`db.%s.find({"%s":"value"})`, table, lookupField)},
 			queryHelper{label: "Recent documents", template: fmt.Sprintf(`db.%s.find({})`, table)},
 			queryHelper{label: "Count by field", template: fmt.Sprintf(`db.%s.countDocuments({"%s":"value"})`, table, lookupField)},
@@ -3481,7 +3508,7 @@ func (m Model) generatedMongoMonitorHelpers(table string) []queryHelper {
 		groupField = filterField
 	}
 	items := []queryHelper{
-		{label: "Project top schema fields", template: fmt.Sprintf(`db.%s.aggregate([{"$limit":50},{"$project":{"%s":1,"%s":1}}])`, table, filterField, groupField)},
+		{label: "Project top schema fields", template: fmt.Sprintf(`db.%s.find({}, {"%s":1, "%s":1})`, table, filterField, groupField)},
 		{label: "Match likely field + sort recent", template: fmt.Sprintf(`db.%s.find({"%s":"value"})`, table, filterField)},
 		{label: "Count grouped values", template: fmt.Sprintf(`db.%s.aggregate([{"$group":{"_id":"$%s","count":{"$sum":1}}},{"$sort":{"count":-1}},{"$limit":20}])`, table, groupField)},
 		{label: "Documents missing field", template: fmt.Sprintf(`db.%s.find({"%s":{"$exists":false}})`, table, filterField)},

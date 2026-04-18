@@ -7,9 +7,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"dbkit/internal/completion"
-	"dbkit/internal/config"
-	"dbkit/internal/db"
+	"bobdb/internal/completion"
+	"bobdb/internal/config"
+	"bobdb/internal/db"
 )
 
 type fakeDB struct {
@@ -205,7 +205,7 @@ func TestBrowseViewStaysWithinWindowHeight(t *testing.T) {
 	if got := strings.Count(view, "\n") + 1; got != m.height {
 		t.Fatalf("browse view rendered %d lines, want %d", got, m.height)
 	}
-	if !strings.Contains(view, "dbkit") {
+	if !strings.Contains(view, "bobdb") {
 		t.Fatalf("expected global header to remain visible")
 	}
 }
@@ -2109,6 +2109,263 @@ func TestMongoShellFormatCollectionSwitchRebuildsQuery(t *testing.T) {
 	got := next.(Model)
 	if got.queryInput.Value() != "db.comments.find({})" {
 		t.Fatalf("expected collection switch to rebuild query, got %q", got.queryInput.Value())
+	}
+}
+
+func TestMongoFindOneCollectionSwitchRebuildsQuery(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tables = []string{"users", "comments", "events"}
+	m.queryInput.SetValue(`db.users.findOne({})`)
+	setTextareaCursor(&m.queryInput, 0, 3)
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected collection completion to open")
+	}
+	for i, item := range m.columnPickerItems {
+		if item.Label == "comments" {
+			m.columnPickerCursor = i
+			break
+		}
+	}
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+	if got.queryInput.Value() != "db.comments.findOne({})" {
+		t.Fatalf("expected findOne collection switch to preserve method case, got %q", got.queryInput.Value())
+	}
+}
+
+func TestMongoFindProjectionPickerOpensAtEndOfSingleArgFind(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "status", Type: "string"},
+			{Name: "email", Type: "string"},
+			{Name: "created_at", Type: "timestamp"},
+		},
+	}
+	query := `db.users.find({"status":"active"})`
+	m.queryInput.SetValue(query)
+	setTextareaCursor(&m.queryInput, 0, len(query))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected mongo projection completion to open")
+	}
+	if m.columnPickerTitle != "Project Fields" {
+		t.Fatalf("picker title = %q, want Project Fields", m.columnPickerTitle)
+	}
+	if !m.columnPickerMulti {
+		t.Fatalf("expected multi-select projection picker")
+	}
+}
+
+func TestMongoFindOneFilterCompletionSuggestsFields(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "email", Type: "string"},
+			{Name: "status", Type: "string"},
+		},
+	}
+	m.queryInput.SetValue(`db.users.findOne({`)
+	setTextareaCursor(&m.queryInput, 0, len(`db.users.findOne({`))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected findOne filter completion to open")
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.Label] = true
+	}
+	if !found["email"] || !found["status"] {
+		t.Fatalf("expected schema field suggestions in findOne filter, got %v", found)
+	}
+}
+
+func TestMongoFindProjectionPickerInsertsSecondArg(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "status", Type: "string"},
+			{Name: "email", Type: "string"},
+			{Name: "created_at", Type: "timestamp"},
+		},
+	}
+	query := `db.users.find({"status":"active"})`
+	m.queryInput.SetValue(query)
+	setTextareaCursor(&m.queryInput, 0, len(query))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected mongo projection completion to open")
+	}
+	for i, item := range m.columnPickerItems {
+		if item.Label == "email" || item.Label == "created_at" {
+			m.columnPickerItems[i].Selected = true
+		}
+	}
+
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+	want := `db.users.find({"status":"active"}, {"email":1, "created_at":1})`
+	if got.queryInput.Value() != want {
+		t.Fatalf("query input = %q, want %q", got.queryInput.Value(), want)
+	}
+}
+
+func TestMongoFindProjectionPickerReopensForExistingProjection(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "email", Type: "string"},
+			{Name: "created_at", Type: "timestamp"},
+			{Name: "status", Type: "string"},
+		},
+	}
+	query := `db.users.find({}, {"email":1,"created_at":1})`
+	m.queryInput.SetValue(query)
+	setTextareaCursor(&m.queryInput, 0, len(`db.users.find({}, {"email":1`))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected mongo projection completion to open")
+	}
+	selected := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		selected[item.Label] = item.Selected
+	}
+	if !selected["email"] || !selected["created_at"] {
+		t.Fatalf("expected existing projection selections to stay selected, got %#v", m.columnPickerItems)
+	}
+}
+
+func TestMongoFindOneProjectionPickerInsertsSecondArg(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "status", Type: "string"},
+			{Name: "email", Type: "string"},
+			{Name: "created_at", Type: "timestamp"},
+		},
+	}
+	query := `db.users.findOne({"status":"active"})`
+	m.queryInput.SetValue(query)
+	setTextareaCursor(&m.queryInput, 0, len(query))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected mongo projection completion to open")
+	}
+	for i, item := range m.columnPickerItems {
+		if item.Label == "email" || item.Label == "created_at" {
+			m.columnPickerItems[i].Selected = true
+		}
+	}
+
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+	want := `db.users.findOne({"status":"active"}, {"email":1, "created_at":1})`
+	if got.queryInput.Value() != want {
+		t.Fatalf("query input = %q, want %q", got.queryInput.Value(), want)
+	}
+}
+
+func TestMongoAggregateStageCompletionOpensAtPipelineStart(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "status", Type: "string"},
+			{Name: "created_at", Type: "timestamp"},
+		},
+	}
+	query := `db.users.aggregate([`
+	m.queryInput.SetValue(query)
+	setTextareaCursor(&m.queryInput, 0, len(query))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected aggregate stage completion to open")
+	}
+	if m.columnPickerTitle != "Aggregate Stage" {
+		t.Fatalf("picker title = %q, want Aggregate Stage", m.columnPickerTitle)
+	}
+	found := map[string]bool{}
+	for _, item := range m.columnPickerItems {
+		found[item.Label] = true
+	}
+	if !found["$match"] || !found["$project"] || !found["$group"] {
+		t.Fatalf("expected aggregate stage suggestions, got %v", found)
+	}
+}
+
+func TestMongoAggregateStageCompletionInsertsSingleStage(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "mongo"}
+	m.activeTab = tabQuery
+	m.focus = panelRight
+	m.queryFocus = true
+	m.queryInput.Focus()
+	m.tableSchema = &db.TableSchema{
+		Name: "users",
+		Columns: []db.ColumnInfo{
+			{Name: "status", Type: "string"},
+			{Name: "created_at", Type: "timestamp"},
+		},
+	}
+	query := `db.users.aggregate([`
+	m.queryInput.SetValue(query)
+	setTextareaCursor(&m.queryInput, 0, len(query))
+
+	if ok, _ := m.openCompletionForCursor(true); !ok {
+		t.Fatalf("expected aggregate stage completion to open")
+	}
+	for i, item := range m.columnPickerItems {
+		if item.Label == "$match" {
+			m.columnPickerCursor = i
+			break
+		}
+	}
+	next, _ := m.updateColumnPicker(tea.KeyMsg{Type: tea.KeyTab})
+	got := next.(Model)
+	want := `db.users.aggregate([{"$match":{"status":""}}`
+	if got.queryInput.Value() != want {
+		t.Fatalf("query input = %q, want %q", got.queryInput.Value(), want)
 	}
 }
 
