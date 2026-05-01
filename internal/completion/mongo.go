@@ -495,7 +495,11 @@ func MongoPlaceholderForType(fieldType string) string {
 		return "[]"
 	case "object", "document", "map", "mixed":
 		return "{}"
-	case "bool", "boolean", "int", "uint", "float", "decimal", "number", "null":
+	case "bool", "boolean":
+		return "false"
+	case "int", "uint", "float", "decimal", "number":
+		return "0"
+	case "null":
 		return "null"
 	default:
 		return `""`
@@ -826,7 +830,10 @@ func mongoComplete(req Request) *Result {
 		if command == "find" && tokenIdx >= 4 {
 			ctx.Title = "Sort"
 		}
-		if strings.HasPrefix(tokenText, "{") && len(tokenText) > 1 {
+		// Resolve field/operator bounds even when token == "{" alone, so the
+		// completion prefix is reset to the empty key (not "{") and the
+		// schema-driven field items survive ranking.
+		if strings.HasPrefix(tokenText, "{") {
 			if field, ok := MongoJSONComparisonFieldContext(tokenText, cursor-start); ok && field != "" {
 				if opStart, opEnd, _, opOK := MongoJSONOperatorPairBounds(tokenText, cursor-start); opOK {
 					ctx.Title = "Mongo Operator"
@@ -1046,7 +1053,28 @@ type mongoArgResult struct {
 	needValues *ValueRequest
 }
 
+// normalizeMongoCommand maps shell method names (insertOne, updateMany, etc.)
+// to the internal command keys the switch in mongoArgumentItems handles.
+// Without this, `db.users.insertOne(` would fall through to default and
+// return no scaffold.
+func normalizeMongoCommand(cmd string) string {
+	switch cmd {
+	case "insertone", "insertmany":
+		return "insert"
+	case "updateone", "updatemany", "replaceone",
+		"findoneandupdate", "findoneandreplace":
+		return "update"
+	case "deleteone", "deletemany", "remove",
+		"findoneanddelete":
+		return "delete"
+	case "countdocuments", "estimateddocumentcount":
+		return "count"
+	}
+	return cmd
+}
+
 func mongoArgumentItems(req Request, command, collection string, tokenIdx int, token string, tokenCursor int) mongoArgResult {
+	command = normalizeMongoCommand(command)
 	// Only use req.Schema if it matches the collection we're completing for.
 	// The caller may have resolved schema for InferredTable which could differ
 	// from the token-parsed collection in edge cases.
@@ -1098,7 +1126,10 @@ func mongoArgumentItems(req Request, command, collection string, tokenIdx int, t
 	}
 
 	trimmedToken := strings.TrimSpace(token)
-	if strings.HasPrefix(trimmedToken, "{") && len(trimmedToken) > 1 {
+	// `{` alone is a valid field-key context (cursor right after the brace);
+	// don't gate this path behind len > 1 or schema-driven completion goes
+	// silent for `db.users.insertOne({`.
+	if strings.HasPrefix(trimmedToken, "{") {
 		if valueItems, valueReq := mongoJSONValueItems(req, collection, fields, fieldTypes, token, tokenCursor); valueItems != nil {
 			return mongoArgResult{items: valueItems, needSchema: needSchema, needValues: valueReq}
 		}

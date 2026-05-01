@@ -1920,12 +1920,12 @@ func TestMongoFieldFilterPlaceholderUsesTypedLiteralForBool(t *testing.T) {
 	}
 	found := false
 	for _, item := range result.Items {
-		if item.Label == "isDemo" && strings.Contains(item.InsertText, `"isDemo":null`) {
+		if item.Label == "isDemo" && strings.Contains(item.InsertText, `"isDemo":false`) {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected bool field scaffold to use concrete unquoted literal, got %#v", result.Items)
+		t.Fatalf("expected bool field scaffold to default to unquoted false, got %#v", result.Items)
 	}
 }
 

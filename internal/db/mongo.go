@@ -245,14 +245,14 @@ func (d *MongoDB) runFind(rest string) (*QueryResult, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid filter json: %w", err)
 		}
-		if err := bson.UnmarshalExtJSON([]byte(jsonArg), true, &filter); err != nil {
+		if err := unmarshalMongoJSON(jsonArg, &filter); err != nil {
 			return nil, fmt.Errorf("invalid filter json: %w", err)
 		}
 		tail = strings.TrimSpace(remaining)
 	}
 
 	// Optional limit (any bare integer).
-	if tail != "" && !startsWithJSON(tail) {
+	if tail != "" && !startsWithJSON(tail) && !strings.HasPrefix(tail, "projection:") {
 		word, remaining := nextWord(tail)
 		n, err := strconv.ParseInt(word, 10, 64)
 		if err != nil {
@@ -266,12 +266,25 @@ func (d *MongoDB) runFind(rest string) (*QueryResult, error) {
 
 	// Optional sort JSON (object of field->1/-1).
 	if startsWithJSON(tail) {
-		jsonArg, _, err := extractJSONArg(tail)
+		jsonArg, remaining, err := extractJSONArg(tail)
 		if err != nil {
 			return nil, fmt.Errorf("invalid sort json: %w", err)
 		}
-		if err := bson.UnmarshalExtJSON([]byte(jsonArg), true, &sort); err != nil {
+		if err := unmarshalMongoJSON(jsonArg, &sort); err != nil {
 			return nil, fmt.Errorf("invalid sort json: %w", err)
+		}
+		tail = strings.TrimSpace(remaining)
+	}
+
+	// Optional projection JSON (prefixed to disambiguate from sort).
+	var projection bson.D
+	if projectionRaw, ok := strings.CutPrefix(tail, "projection:"); ok {
+		jsonArg, _, err := extractJSONArg(projectionRaw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid projection json: %w", err)
+		}
+		if err := unmarshalMongoJSON(jsonArg, &projection); err != nil {
+			return nil, fmt.Errorf("invalid projection json: %w", err)
 		}
 	}
 
@@ -282,6 +295,9 @@ func (d *MongoDB) runFind(rest string) (*QueryResult, error) {
 	findOpts := options.Find().SetLimit(limit)
 	if len(sort) > 0 {
 		findOpts.SetSort(sort)
+	}
+	if len(projection) > 0 {
+		findOpts.SetProjection(projection)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
@@ -315,7 +331,7 @@ func (d *MongoDB) runAggregate(rest string) (*QueryResult, error) {
 	}
 
 	var pipeline []bson.D
-	if err := bson.UnmarshalExtJSON([]byte(pipelineJSON), true, &pipeline); err != nil {
+	if err := unmarshalMongoJSON(pipelineJSON, &pipeline); err != nil {
 		return nil, fmt.Errorf("invalid pipeline json: %w", err)
 	}
 	stages := make(mongo.Pipeline, 0, len(pipeline))
@@ -353,7 +369,7 @@ func (d *MongoDB) runCount(rest string) (*QueryResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := bson.UnmarshalExtJSON([]byte(jsonArg), true, &filter); err != nil {
+		if err := unmarshalMongoJSON(jsonArg, &filter); err != nil {
 			return nil, fmt.Errorf("invalid filter json: %w", err)
 		}
 	}
@@ -382,7 +398,7 @@ func (d *MongoDB) runInsert(rest string) (*QueryResult, error) {
 	}
 
 	var doc bson.M
-	if err := bson.UnmarshalExtJSON([]byte(jsonArg), true, &doc); err != nil {
+	if err := unmarshalMongoJSON(jsonArg, &doc); err != nil {
 		return nil, fmt.Errorf("invalid document json: %w", err)
 	}
 
@@ -413,11 +429,11 @@ func (d *MongoDB) runUpdate(rest string) (*QueryResult, error) {
 	many := strings.EqualFold(strings.TrimSpace(remaining), "many")
 
 	var filter bson.M
-	if err := bson.UnmarshalExtJSON([]byte(filterJSON), true, &filter); err != nil {
+	if err := unmarshalMongoJSON(filterJSON, &filter); err != nil {
 		return nil, fmt.Errorf("invalid filter json: %w", err)
 	}
 	var update bson.M
-	if err := bson.UnmarshalExtJSON([]byte(updateJSON), true, &update); err != nil {
+	if err := unmarshalMongoJSON(updateJSON, &update); err != nil {
 		return nil, fmt.Errorf("invalid update json: %w", err)
 	}
 
@@ -451,7 +467,7 @@ func (d *MongoDB) runDelete(rest string) (*QueryResult, error) {
 	many := strings.EqualFold(strings.TrimSpace(remaining), "many")
 
 	var filter bson.M
-	if err := bson.UnmarshalExtJSON([]byte(filterJSON), true, &filter); err != nil {
+	if err := unmarshalMongoJSON(filterJSON, &filter); err != nil {
 		return nil, fmt.Errorf("invalid filter json: %w", err)
 	}
 
@@ -537,10 +553,10 @@ func extractJSONArg(s string) (jsonArg, rest string, err error) {
 	}
 
 	depth := 0
-	inString := false
+	var stringDelim rune
 	escaped := false
 	for i, r := range s {
-		if inString {
+		if stringDelim != 0 {
 			if escaped {
 				escaped = false
 				continue
@@ -549,14 +565,14 @@ func extractJSONArg(s string) (jsonArg, rest string, err error) {
 				escaped = true
 				continue
 			}
-			if r == '"' {
-				inString = false
+			if r == stringDelim {
+				stringDelim = 0
 			}
 			continue
 		}
 
-		if r == '"' {
-			inString = true
+		if r == '"' || r == '\'' {
+			stringDelim = r
 			continue
 		}
 		if r == start {
@@ -731,9 +747,17 @@ func parseShellQuery(query string) (string, bool) {
 
 	switch method {
 	case "find":
-		return "find " + collection + " " + arg0, true
+		cmd := "find " + collection + " " + arg0
+		if arg1 != "" {
+			cmd += " projection:" + arg1
+		}
+		return cmd, true
 	case "findone":
-		return "find " + collection + " " + arg0 + " 1", true
+		cmd := "find " + collection + " " + arg0 + " 1"
+		if arg1 != "" {
+			cmd += " projection:" + arg1
+		}
+		return cmd, true
 	case "aggregate":
 		if arg0 == "{}" {
 			arg0 = "[]"
@@ -768,7 +792,7 @@ func parseShellQuery(query string) (string, bool) {
 // Input starts immediately after the opening '('.
 func extractShellArgs(s string) (string, bool) {
 	depth := 1
-	inStr := false
+	var strDelim byte
 	escape := false
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
@@ -776,15 +800,18 @@ func extractShellArgs(s string) (string, bool) {
 			escape = false
 			continue
 		}
-		if ch == '\\' && inStr {
+		if ch == '\\' && strDelim != 0 {
 			escape = true
 			continue
 		}
-		if ch == '"' {
-			inStr = !inStr
+		if strDelim != 0 {
+			if ch == strDelim {
+				strDelim = 0
+			}
 			continue
 		}
-		if inStr {
+		if ch == '"' || ch == '\'' {
+			strDelim = ch
 			continue
 		}
 		switch ch {
@@ -804,7 +831,7 @@ func extractShellArgs(s string) (string, bool) {
 func splitShellArgs(s string) []string {
 	var args []string
 	depth := 0
-	inStr := false
+	var strDelim byte
 	escape := false
 	start := 0
 	for i := 0; i < len(s); i++ {
@@ -813,15 +840,18 @@ func splitShellArgs(s string) []string {
 			escape = false
 			continue
 		}
-		if ch == '\\' && inStr {
+		if ch == '\\' && strDelim != 0 {
 			escape = true
 			continue
 		}
-		if ch == '"' {
-			inStr = !inStr
+		if strDelim != 0 {
+			if ch == strDelim {
+				strDelim = 0
+			}
 			continue
 		}
-		if inStr {
+		if ch == '"' || ch == '\'' {
+			strDelim = ch
 			continue
 		}
 		switch ch {
@@ -838,4 +868,211 @@ func splitShellArgs(s string) []string {
 	}
 	args = append(args, s[start:])
 	return args
+}
+
+// unmarshalMongoJSON relaxes Mongo-shell syntax (bare keys, single quotes,
+// trailing commas, ObjectId/ISODate literals) into strict extended JSON before
+// handing it to the BSON parser.
+func unmarshalMongoJSON(raw string, out any) error {
+	// canonical=false accepts both canonical and relaxed extended JSON, so
+	// shell-style ISODate output like {"$date":"2025-01-01T00:00:00Z"} parses.
+	return bson.UnmarshalExtJSON([]byte(relaxJSON(raw)), false, out)
+}
+
+// relaxJSON converts a Mongo-shell-ish JSON fragment into strict extended JSON.
+// It preserves content inside double-quoted strings and only rewrites tokens
+// that strict JSON would reject.
+func relaxJSON(s string) string {
+	var out strings.Builder
+	out.Grow(len(s))
+	for i := 0; i < len(s); {
+		if repl, adv, ok := tryConvertFuncLiteral(s, i); ok {
+			out.WriteString(repl)
+			i += adv
+			continue
+		}
+
+		ch := s[i]
+
+		// Drop trailing commas before } or ].
+		if ch == ',' {
+			j := i + 1
+			for j < len(s) && isJSONSpace(s[j]) {
+				j++
+			}
+			if j < len(s) && (s[j] == '}' || s[j] == ']') {
+				out.WriteString(s[i+1 : j])
+				i = j
+				continue
+			}
+		}
+
+		// Single-quoted string → double-quoted.
+		if ch == '\'' {
+			out.WriteByte('"')
+			i++
+			for i < len(s) {
+				c := s[i]
+				if c == '\\' && i+1 < len(s) {
+					n := s[i+1]
+					if n == '\'' {
+						out.WriteByte('\'')
+					} else {
+						out.WriteByte(c)
+						out.WriteByte(n)
+					}
+					i += 2
+					continue
+				}
+				if c == '"' {
+					out.WriteString(`\"`)
+					i++
+					continue
+				}
+				if c == '\'' {
+					out.WriteByte('"')
+					i++
+					break
+				}
+				out.WriteByte(c)
+				i++
+			}
+			continue
+		}
+
+		// Double-quoted string: copy through verbatim.
+		if ch == '"' {
+			out.WriteByte(ch)
+			i++
+			for i < len(s) {
+				c := s[i]
+				out.WriteByte(c)
+				i++
+				if c == '\\' && i < len(s) {
+					out.WriteByte(s[i])
+					i++
+					continue
+				}
+				if c == '"' {
+					break
+				}
+			}
+			continue
+		}
+
+		// Bare identifier in key position → quoted.
+		if isIdentStart(ch) {
+			j := i + 1
+			for j < len(s) && isIdentCont(s[j]) {
+				j++
+			}
+			k := j
+			for k < len(s) && isJSONSpace(s[k]) {
+				k++
+			}
+			if k < len(s) && s[k] == ':' {
+				out.WriteByte('"')
+				out.WriteString(s[i:j])
+				out.WriteByte('"')
+				i = j
+				continue
+			}
+			out.WriteString(s[i:j])
+			i = j
+			continue
+		}
+
+		out.WriteByte(ch)
+		i++
+	}
+	return out.String()
+}
+
+// tryConvertFuncLiteral rewrites ObjectId("...") / ISODate("...") style
+// constructors into their extended-JSON equivalents. Returns the replacement
+// string and how many input bytes it consumed.
+func tryConvertFuncLiteral(s string, i int) (string, int, bool) {
+	literals := []struct {
+		name, tag string
+	}{
+		{"ObjectId", "$oid"},
+		{"ObjectID", "$oid"},
+		{"ISODate", "$date"},
+	}
+	for _, lit := range literals {
+		if !strings.HasPrefix(s[i:], lit.name) {
+			continue
+		}
+		// Don't match partial identifiers (e.g. ObjectIdFoo).
+		after := i + len(lit.name)
+		if after < len(s) && isIdentCont(s[after]) {
+			continue
+		}
+		arg, consumed, ok := parseFuncStringArg(s, after)
+		if !ok {
+			continue
+		}
+		return fmt.Sprintf(`{"%s":"%s"}`, lit.tag, arg), len(lit.name) + consumed, true
+	}
+	return "", 0, false
+}
+
+// parseFuncStringArg expects ( "string" ) starting at s[start]. Returns the raw
+// inner bytes (escapes preserved) and the number of bytes consumed from start.
+func parseFuncStringArg(s string, start int) (string, int, bool) {
+	i := start
+	for i < len(s) && isJSONSpace(s[i]) {
+		i++
+	}
+	if i >= len(s) || s[i] != '(' {
+		return "", 0, false
+	}
+	i++
+	for i < len(s) && isJSONSpace(s[i]) {
+		i++
+	}
+	if i >= len(s) {
+		return "", 0, false
+	}
+	quote := s[i]
+	if quote != '"' && quote != '\'' {
+		return "", 0, false
+	}
+	i++
+	var buf strings.Builder
+	for i < len(s) {
+		c := s[i]
+		if c == '\\' && i+1 < len(s) {
+			buf.WriteByte(c)
+			buf.WriteByte(s[i+1])
+			i += 2
+			continue
+		}
+		if c == quote {
+			i++
+			break
+		}
+		buf.WriteByte(c)
+		i++
+	}
+	for i < len(s) && isJSONSpace(s[i]) {
+		i++
+	}
+	if i >= len(s) || s[i] != ')' {
+		return "", 0, false
+	}
+	i++
+	return buf.String(), i - start, true
+}
+
+func isIdentStart(c byte) bool {
+	return c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isIdentCont(c byte) bool {
+	return isIdentStart(c) || (c >= '0' && c <= '9')
+}
+
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }

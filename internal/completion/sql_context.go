@@ -204,7 +204,10 @@ func predicateStart(before string) int {
 	lastAnd := LastKeyword(before, " and ")
 	lastOr := LastKeyword(before, " or ")
 	lastHaving := LastKeyword(before, " having ")
-	start := max(max(lastWhere, lastAnd), max(lastOr, lastHaving))
+	// JOIN ... ON is a predicate context too — without this, completing
+	// columns inside an ON clause falls through to the keyword picker.
+	lastOn := LastKeyword(before, " on ")
+	start := max(max(lastWhere, lastAnd), max(lastOr, max(lastHaving, lastOn)))
 
 	updateIdx := LastKeyword(before, "update ")
 	setIdx := LastKeyword(before, " set ")
@@ -216,6 +219,189 @@ func predicateStart(before string) int {
 		}
 	}
 	return start
+}
+
+// joinKeywordPattern matches all JOIN keyword variants (LEFT/RIGHT/INNER/
+// OUTER/CROSS/FULL/NATURAL/LATERAL [OUTER] JOIN, plain JOIN). Used to
+// normalize the FROM body before fragment splitting so multi-word join
+// forms collapse to a single ` join ` token.
+var joinKeywordPattern = regexp.MustCompile(`\b(?:(?:left|right|inner|outer|cross|full|natural|lateral)\s+)?(?:outer\s+)?join\b`)
+
+func normalizeJoinKeywords(s string) string {
+	return joinKeywordPattern.ReplaceAllString(s, "join")
+}
+
+// AliasBinding maps a FROM-clause alias to the underlying table name.
+// Bare table references map alias=table.
+type AliasBinding struct {
+	Alias string
+	Table string
+}
+
+// ParseFromBindings extracts (alias, table) pairs from the FROM/JOIN list of
+// the lowercased before string. CTE names and derived tables are skipped —
+// they have no resolvable schema. Limited to single-line forms.
+func ParseFromBindings(before string) []AliasBinding {
+	lower := normalizeWhitespace(before)
+	fromIdx := LastKeyword(lower, " from ")
+	if fromIdx < 0 && strings.HasPrefix(lower, "from ") {
+		fromIdx = 0
+	}
+	if fromIdx < 0 {
+		return nil
+	}
+	body := lower[fromIdx:]
+	for _, kw := range []string{" where ", " group by ", " order by ", " limit ", " having "} {
+		if i := strings.Index(body, kw); i >= 0 {
+			body = body[:i]
+		}
+	}
+	body = strings.TrimPrefix(body, " from ")
+	body = strings.TrimPrefix(body, "from ")
+	body = normalizeJoinKeywords(body)
+
+	var bindings []AliasBinding
+	// Split on commas (top-level only) and JOIN keywords.
+	for _, frag := range splitFromFragments(body) {
+		frag = strings.TrimSpace(frag)
+		if frag == "" || strings.HasPrefix(frag, "(") {
+			continue
+		}
+		// Drop ON-clause tail if present: `orders o on u.id = o.uid`.
+		if i := strings.Index(frag, " on "); i >= 0 {
+			frag = frag[:i]
+		}
+		fields := strings.Fields(frag)
+		if len(fields) == 0 {
+			continue
+		}
+		table := strings.Trim(fields[0], `"`)
+		alias := table
+		if len(fields) >= 3 && fields[1] == "as" {
+			alias = strings.Trim(fields[2], `"`)
+		} else if len(fields) >= 2 {
+			alias = strings.Trim(fields[1], `"`)
+		}
+		bindings = append(bindings, AliasBinding{Alias: alias, Table: table})
+	}
+	return bindings
+}
+
+// splitFromFragments splits a FROM body on top-level commas and JOIN
+// keywords, preserving parenthesized derived-table content as one fragment.
+func splitFromFragments(body string) []string {
+	var out []string
+	depth := 0
+	current := strings.Builder{}
+	push := func() {
+		s := strings.TrimSpace(current.String())
+		if s != "" {
+			out = append(out, s)
+		}
+		current.Reset()
+	}
+	runes := []rune(body)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if r == '(' {
+			depth++
+		} else if r == ')' {
+			if depth > 0 {
+				depth--
+			}
+		}
+		if depth == 0 && r == ',' {
+			push()
+			continue
+		}
+		// Detect top-level " join " (and inner/outer/left/right/full/cross
+		// variants collapse to the join keyword).
+		if depth == 0 && r == ' ' && i+5 < len(runes) {
+			if string(runes[i:i+6]) == " join " {
+				push()
+				i += 5
+				continue
+			}
+		}
+		current.WriteRune(r)
+	}
+	push()
+	return out
+}
+
+// ResolveAliasTable returns the underlying table name for an alias in the
+// query's FROM clause, or "" when the alias isn't bound or the binding is a
+// CTE / derived table.
+func ResolveAliasTable(before, alias string) string {
+	if alias == "" {
+		return ""
+	}
+	a := strings.ToLower(alias)
+	for _, b := range ParseFromBindings(strings.ToLower(before)) {
+		if b.Alias == a {
+			return b.Table
+		}
+	}
+	return ""
+}
+
+// queryHasMultipleTables reports whether the query references more than one
+// table source: JOIN, comma-separated FROM list, derived table, or CTE.
+// When true, schema-driven column suggestions are ambiguous unless the user
+// disambiguates with an alias prefix (`a.col`).
+func queryHasMultipleTables(before string) bool {
+	normalized := normalizeJoinKeywords(before)
+	if strings.Contains(normalized, " join ") {
+		return true
+	}
+	// Only treat WITH at the start of the query as a CTE marker — a
+	// substring match would false-trigger on string literals like
+	// `WHERE name = 'thing with stuff'`.
+	if strings.HasPrefix(strings.TrimSpace(before), "with ") {
+		return true
+	}
+	// Comma in the FROM clause = multiple tables.
+	fromIdx := LastKeyword(before, " from ")
+	if fromIdx >= 0 {
+		afterFrom := before[fromIdx+len(" from "):]
+		// Stop at the next clause keyword.
+		for _, kw := range []string{" where ", " group by ", " order by ", " limit ", " having "} {
+			if i := strings.Index(afterFrom, kw); i >= 0 {
+				afterFrom = afterFrom[:i]
+			}
+		}
+		// Strip parenthesized derived tables before checking commas at the
+		// top level of the FROM list.
+		depth := 0
+		topLevel := strings.Builder{}
+		topLevel.Grow(len(afterFrom))
+		for _, r := range afterFrom {
+			switch r {
+			case '(':
+				depth++
+				continue
+			case ')':
+				if depth > 0 {
+					depth--
+				}
+				continue
+			}
+			if depth == 0 {
+				topLevel.WriteRune(r)
+			} else if r == ',' {
+				// derived-table content; ignored
+			}
+		}
+		if strings.Contains(topLevel.String(), ",") {
+			return true
+		}
+		// Derived tables (`FROM (SELECT …) sub`) also count as multi-table
+		// for column-resolution purposes.
+		if strings.Contains(afterFrom, "(") && strings.Contains(strings.ToLower(afterFrom), "select") {
+			return true
+		}
+	}
+	return false
 }
 
 func inOrderByList(before string) bool {

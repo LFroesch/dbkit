@@ -2,6 +2,10 @@ package db
 
 import "fmt"
 
+// SQLMaxRows caps the number of rows scanned by SQL backends (SQLite, Postgres)
+// to avoid OOM on unbounded SELECTs. Mirrors mongoMaxLimit for Mongo.
+const SQLMaxRows = 1000
+
 // ColumnInfo describes a single column/field.
 type ColumnInfo struct {
 	Name       string

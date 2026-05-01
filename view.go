@@ -1106,6 +1106,9 @@ func (m Model) renderResultMeta() string {
 		dimStyle.Render(fmt.Sprintf("%d row(s)", len(m.queryResult.Rows))),
 		dimStyle.Render(fmt.Sprintf("cols %d-%d/%d", start, end, totalCols)),
 	}
+	if m.queryResult.Message != "" {
+		parts = append(parts, warnStyle.Render(m.queryResult.Message))
+	}
 	if totalCols > m.resultVisibleColumn {
 		parts = append(parts, accentStyle.Render("←/→ columns"))
 	}

@@ -159,6 +159,30 @@ func sqlColumnCompletion(req Request, ctx sqlContext) *Result {
 	prefix := strings.ToLower(TokenValue(query[start:end]))
 	aliasPrefix := extractAliasPrefix(string(query[start:end]))
 
+	// Multi-table guard: when the query has JOINs, comma-separated FROM
+	// tables, CTEs, or derived tables, suggesting columns from a single
+	// schema is misleading. Only fall through when the user typed an alias
+	// that resolves to the inferred table; otherwise suppress. We inspect
+	// the whole query (not just before-cursor) because in SELECT-list
+	// positions the JOIN/FROM body sits after the cursor.
+	var needAliasSchema string
+	fullQueryLower := strings.ToLower(req.Query)
+	if queryHasMultipleTables(fullQueryLower) {
+		alias := strings.TrimSuffix(aliasPrefix, ".")
+		if alias == "" {
+			return nil
+		}
+		bound := ResolveAliasTable(fullQueryLower, alias)
+		if bound == "" {
+			return nil
+		}
+		if req.InferredTable != "" && !strings.EqualFold(bound, req.InferredTable) {
+			// Alias points at a different table than the schema we have.
+			// Ask the caller to load the right schema and surface a hint.
+			needAliasSchema = bound
+		}
+	}
+
 	// Build column items from schema
 	items := sqlColumnItems(req, colContext.includeStar, aliasPrefix, prefix)
 
@@ -171,9 +195,17 @@ func sqlColumnCompletion(req Request, ctx sqlContext) *Result {
 			break
 		}
 	}
-	if !hasRealCols && req.Schema == nil && req.InferredTable != "" {
+	if needAliasSchema != "" {
+		needSchema = needAliasSchema
+		// Preserve the user-typed token (e.g. "o.") in InsertText so an
+		// accidental tab on the loading hint doesn't blow away the alias
+		// prefix. The async-loaded schema replaces the items on next render.
+		preserved := string(query[start:end])
+		items = []Item{{Label: "loading fields…", Detail: needAliasSchema, InsertText: preserved}}
+	} else if !hasRealCols && req.Schema == nil && req.InferredTable != "" {
 		needSchema = req.InferredTable
-		items = append(items, Item{Label: "loading fields…", Detail: req.InferredTable, InsertText: ""})
+		preserved := string(query[start:end])
+		items = append(items, Item{Label: "loading fields…", Detail: req.InferredTable, InsertText: preserved})
 	}
 
 	if len(items) == 0 {
@@ -288,7 +320,7 @@ func sqlTableCompletion(req Request, ctx sqlContext) *Result {
 
 func sqlValueCompletion(req Request) *Result {
 	runes := []rune(req.Query)
-	openIdx, _, ok := FindOpenQuote(runes, req.Cursor)
+	openIdx, quote, ok := FindOpenQuote(runes, req.Cursor)
 	if !ok {
 		return nil
 	}
@@ -305,6 +337,26 @@ func sqlValueCompletion(req Request) *Result {
 	key := ValueCacheKey(table, col)
 	values := req.ValueCache[key]
 	cached := req.ValueCache != nil && values != nil
+
+	// Extend End to consume the rest of the literal body so the inserted
+	// value replaces the whole literal contents (parity with Mongo's
+	// MongoJSONValueBounds). The existing closing quote stays in place.
+	end := req.Cursor
+	for end < len(runes) {
+		r := runes[end]
+		if r == quote {
+			if quote == '\'' && end+1 < len(runes) && runes[end+1] == '\'' {
+				end += 2
+				continue
+			}
+			break
+		}
+		if r == '\\' && end+1 < len(runes) {
+			end += 2
+			continue
+		}
+		end++
+	}
 
 	prefix := strings.ToLower(string(runes[openIdx+1 : req.Cursor]))
 	items := make([]Item, 0, len(values)+1)
@@ -328,7 +380,7 @@ func sqlValueCompletion(req Request) *Result {
 		Items:      items,
 		Title:      "Values for " + col,
 		Start:      openIdx + 1,
-		End:        req.Cursor,
+		End:        end,
 		Fallback:   prefix,
 		ValueCol:   col,
 		ValueTable: table,

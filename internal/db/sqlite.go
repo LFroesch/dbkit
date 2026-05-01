@@ -128,7 +128,12 @@ func (d *SQLiteDB) RunQuery(query string) (*QueryResult, error) {
 		ptrs[i] = &vals[i]
 	}
 
+	capped := false
 	for rows.Next() {
+		if int64(len(result.Rows)) >= SQLMaxRows {
+			capped = true
+			break
+		}
 		if err := rows.Scan(ptrs...); err != nil {
 			return nil, err
 		}
@@ -141,6 +146,9 @@ func (d *SQLiteDB) RunQuery(query string) (*QueryResult, error) {
 			}
 		}
 		result.Rows = append(result.Rows, row)
+	}
+	if capped {
+		result.Message = fmt.Sprintf("%d rows (capped — result set larger; add LIMIT/WHERE to narrow)", SQLMaxRows)
 	}
 	return &result, nil
 }
