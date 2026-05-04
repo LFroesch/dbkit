@@ -236,7 +236,9 @@ func (d *MongoDB) runFind(rest string) (*QueryResult, error) {
 
 	filter := bson.M{}
 	limit := mongoDefaultLimit
+	skip := int64(0)
 	var sort bson.D
+	var projection bson.D
 	tail = strings.TrimSpace(tail)
 
 	// Optional filter JSON.
@@ -251,40 +253,65 @@ func (d *MongoDB) runFind(rest string) (*QueryResult, error) {
 		tail = strings.TrimSpace(remaining)
 	}
 
-	// Optional limit (any bare integer).
-	if tail != "" && !startsWithJSON(tail) && !strings.HasPrefix(tail, "projection:") {
-		word, remaining := nextWord(tail)
-		n, err := strconv.ParseInt(word, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid limit: %w", err)
-		}
-		if n > 0 {
-			limit = n
-		}
-		tail = strings.TrimSpace(remaining)
-	}
-
-	// Optional sort JSON (object of field->1/-1).
-	if startsWithJSON(tail) {
-		jsonArg, remaining, err := extractJSONArg(tail)
-		if err != nil {
-			return nil, fmt.Errorf("invalid sort json: %w", err)
-		}
-		if err := unmarshalMongoJSON(jsonArg, &sort); err != nil {
-			return nil, fmt.Errorf("invalid sort json: %w", err)
-		}
-		tail = strings.TrimSpace(remaining)
-	}
-
-	// Optional projection JSON (prefixed to disambiguate from sort).
-	var projection bson.D
-	if projectionRaw, ok := strings.CutPrefix(tail, "projection:"); ok {
-		jsonArg, _, err := extractJSONArg(projectionRaw)
-		if err != nil {
-			return nil, fmt.Errorf("invalid projection json: %w", err)
-		}
-		if err := unmarshalMongoJSON(jsonArg, &projection); err != nil {
-			return nil, fmt.Errorf("invalid projection json: %w", err)
+	for tail != "" {
+		switch {
+		case strings.HasPrefix(tail, "projection:"):
+			jsonArg, remaining, err := extractJSONArg(strings.TrimSpace(strings.TrimPrefix(tail, "projection:")))
+			if err != nil {
+				return nil, fmt.Errorf("invalid projection json: %w", err)
+			}
+			if err := unmarshalMongoJSON(jsonArg, &projection); err != nil {
+				return nil, fmt.Errorf("invalid projection json: %w", err)
+			}
+			tail = strings.TrimSpace(remaining)
+		case strings.HasPrefix(tail, "sort:"):
+			jsonArg, remaining, err := extractJSONArg(strings.TrimSpace(strings.TrimPrefix(tail, "sort:")))
+			if err != nil {
+				return nil, fmt.Errorf("invalid sort json: %w", err)
+			}
+			if err := unmarshalMongoJSON(jsonArg, &sort); err != nil {
+				return nil, fmt.Errorf("invalid sort json: %w", err)
+			}
+			tail = strings.TrimSpace(remaining)
+		case strings.HasPrefix(tail, "limit:"):
+			word, remaining := nextWord(strings.TrimSpace(strings.TrimPrefix(tail, "limit:")))
+			n, err := strconv.ParseInt(word, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid limit: %w", err)
+			}
+			if n > 0 {
+				limit = n
+			}
+			tail = strings.TrimSpace(remaining)
+		case strings.HasPrefix(tail, "skip:"):
+			word, remaining := nextWord(strings.TrimSpace(strings.TrimPrefix(tail, "skip:")))
+			n, err := strconv.ParseInt(word, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid skip: %w", err)
+			}
+			if n > 0 {
+				skip = n
+			}
+			tail = strings.TrimSpace(remaining)
+		case startsWithJSON(tail):
+			jsonArg, remaining, err := extractJSONArg(tail)
+			if err != nil {
+				return nil, fmt.Errorf("invalid sort json: %w", err)
+			}
+			if err := unmarshalMongoJSON(jsonArg, &sort); err != nil {
+				return nil, fmt.Errorf("invalid sort json: %w", err)
+			}
+			tail = strings.TrimSpace(remaining)
+		default:
+			word, remaining := nextWord(tail)
+			n, err := strconv.ParseInt(word, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid find option %q", word)
+			}
+			if n > 0 {
+				limit = n
+			}
+			tail = strings.TrimSpace(remaining)
 		}
 	}
 
@@ -293,6 +320,9 @@ func (d *MongoDB) runFind(rest string) (*QueryResult, error) {
 	}
 
 	findOpts := options.Find().SetLimit(limit)
+	if skip > 0 {
+		findOpts.SetSkip(skip)
+	}
 	if len(sort) > 0 {
 		findOpts.SetSort(sort)
 	}
@@ -397,13 +427,35 @@ func (d *MongoDB) runInsert(rest string) (*QueryResult, error) {
 		return nil, err
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
+	defer cancel()
+
+	if strings.HasPrefix(strings.TrimSpace(jsonArg), "[") {
+		var docs []bson.M
+		if err := unmarshalMongoJSON(jsonArg, &docs); err != nil {
+			return nil, fmt.Errorf("invalid document json: %w", err)
+		}
+		if len(docs) == 0 {
+			return nil, fmt.Errorf("missing document json")
+		}
+		payload := make([]interface{}, 0, len(docs))
+		for _, doc := range docs {
+			payload = append(payload, doc)
+		}
+		res, err := d.db.Collection(collection).InsertMany(ctx, payload)
+		if err != nil {
+			return nil, err
+		}
+		return &QueryResult{
+			Message:  fmt.Sprintf("inserted %d document(s)", len(res.InsertedIDs)),
+			Affected: int64(len(res.InsertedIDs)),
+		}, nil
+	}
+
 	var doc bson.M
 	if err := unmarshalMongoJSON(jsonArg, &doc); err != nil {
 		return nil, fmt.Errorf("invalid document json: %w", err)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
-	defer cancel()
 	res, err := d.db.Collection(collection).InsertOne(ctx, doc)
 	if err != nil {
 		return nil, err
@@ -726,7 +778,7 @@ func parseShellQuery(query string) (string, bool) {
 	method := strings.ToLower(rest[:parenIdx])
 	rest = rest[parenIdx+1:]
 
-	argsStr, ok := extractShellArgs(rest)
+	argsStr, chain, ok := extractShellArgs(rest)
 	if !ok {
 		return "", false
 	}
@@ -751,7 +803,7 @@ func parseShellQuery(query string) (string, bool) {
 		if arg1 != "" {
 			cmd += " projection:" + arg1
 		}
-		return cmd, true
+		return applyFindCursorMethods(cmd, chain)
 	case "findone":
 		cmd := "find " + collection + " " + arg0 + " 1"
 		if arg1 != "" {
@@ -790,7 +842,7 @@ func parseShellQuery(query string) (string, bool) {
 
 // extractShellArgs extracts the content inside the outermost () of a method call.
 // Input starts immediately after the opening '('.
-func extractShellArgs(s string) (string, bool) {
+func extractShellArgs(s string) (string, string, bool) {
 	depth := 1
 	var strDelim byte
 	escape := false
@@ -820,11 +872,11 @@ func extractShellArgs(s string) (string, bool) {
 		case ')', '}', ']':
 			depth--
 			if depth == 0 {
-				return s[:i], true
+				return s[:i], strings.TrimSpace(s[i+1:]), true
 			}
 		}
 	}
-	return strings.TrimRight(s, ")"), true // lenient: unclosed paren
+	return strings.TrimRight(s, ")"), "", true // lenient: unclosed paren
 }
 
 // splitShellArgs splits top-level comma-separated args (not inside {}, [], ()).
@@ -940,6 +992,14 @@ func relaxJSON(s string) string {
 			continue
 		}
 
+		if ch == '/' {
+			if repl, adv, ok := tryConvertRegexLiteral(s, i); ok {
+				out.WriteString(repl)
+				i += adv
+				continue
+			}
+		}
+
 		// Double-quoted string: copy through verbatim.
 		if ch == '"' {
 			out.WriteByte(ch)
@@ -998,6 +1058,7 @@ func tryConvertFuncLiteral(s string, i int) (string, int, bool) {
 		{"ObjectId", "$oid"},
 		{"ObjectID", "$oid"},
 		{"ISODate", "$date"},
+		{"NumberLong", "$numberLong"},
 	}
 	for _, lit := range literals {
 		if !strings.HasPrefix(s[i:], lit.name) {
@@ -1008,7 +1069,7 @@ func tryConvertFuncLiteral(s string, i int) (string, int, bool) {
 		if after < len(s) && isIdentCont(s[after]) {
 			continue
 		}
-		arg, consumed, ok := parseFuncStringArg(s, after)
+		arg, consumed, ok := parseFuncLiteralArg(s, after, lit.tag == "$numberLong")
 		if !ok {
 			continue
 		}
@@ -1017,9 +1078,9 @@ func tryConvertFuncLiteral(s string, i int) (string, int, bool) {
 	return "", 0, false
 }
 
-// parseFuncStringArg expects ( "string" ) starting at s[start]. Returns the raw
-// inner bytes (escapes preserved) and the number of bytes consumed from start.
-func parseFuncStringArg(s string, start int) (string, int, bool) {
+// parseFuncLiteralArg expects a single constructor argument starting at s[start].
+// It supports quoted strings for ObjectId/ISODate and quoted or bare integers for NumberLong.
+func parseFuncLiteralArg(s string, start int, allowBareNumber bool) (string, int, bool) {
 	i := start
 	for i < len(s) && isJSONSpace(s[i]) {
 		i++
@@ -1036,7 +1097,28 @@ func parseFuncStringArg(s string, start int) (string, int, bool) {
 	}
 	quote := s[i]
 	if quote != '"' && quote != '\'' {
-		return "", 0, false
+		if !allowBareNumber {
+			return "", 0, false
+		}
+		begin := i
+		if s[i] == '-' {
+			i++
+		}
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+		if begin == i || (s[begin] == '-' && begin+1 == i) {
+			return "", 0, false
+		}
+		arg := s[begin:i]
+		for i < len(s) && isJSONSpace(s[i]) {
+			i++
+		}
+		if i >= len(s) || s[i] != ')' {
+			return "", 0, false
+		}
+		i++
+		return arg, i - start, true
 	}
 	i++
 	var buf strings.Builder
@@ -1063,6 +1145,97 @@ func parseFuncStringArg(s string, start int) (string, int, bool) {
 	}
 	i++
 	return buf.String(), i - start, true
+}
+
+func tryConvertRegexLiteral(s string, i int) (string, int, bool) {
+	if i > 0 {
+		prev := s[i-1]
+		if isIdentCont(prev) || prev == '"' || prev == '\'' {
+			return "", 0, false
+		}
+	}
+	j := i + 1
+	var pattern strings.Builder
+	escaped := false
+	for j < len(s) {
+		c := s[j]
+		if escaped {
+			pattern.WriteByte(c)
+			escaped = false
+			j++
+			continue
+		}
+		if c == '\\' {
+			pattern.WriteByte(c)
+			escaped = true
+			j++
+			continue
+		}
+		if c == '/' {
+			j++
+			break
+		}
+		if c == '\n' || c == '\r' {
+			return "", 0, false
+		}
+		pattern.WriteByte(c)
+		j++
+	}
+	if j <= i+1 || j > len(s) {
+		return "", 0, false
+	}
+	flagsStart := j
+	for j < len(s) && ((s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z')) {
+		j++
+	}
+	patternJSON := strconv.Quote(pattern.String())
+	optionsJSON := strconv.Quote(s[flagsStart:j])
+	return fmt.Sprintf(`{"$regularExpression":{"pattern":%s,"options":%s}}`, patternJSON, optionsJSON), j - i, true
+}
+
+func applyFindCursorMethods(cmd, chain string) (string, bool) {
+	chain = strings.TrimSpace(chain)
+	for chain != "" {
+		if !strings.HasPrefix(chain, ".") {
+			return "", false
+		}
+		chain = chain[1:]
+		parenIdx := strings.Index(chain, "(")
+		if parenIdx < 0 {
+			return "", false
+		}
+		method := strings.ToLower(strings.TrimSpace(chain[:parenIdx]))
+		args, rest, ok := extractShellArgs(chain[parenIdx+1:])
+		if !ok {
+			return "", false
+		}
+		argList := splitShellArgs(args)
+		arg0 := ""
+		if len(argList) > 0 {
+			arg0 = strings.TrimSpace(argList[0])
+		}
+		switch method {
+		case "sort":
+			if arg0 == "" {
+				return "", false
+			}
+			cmd += " sort:" + arg0
+		case "limit":
+			if arg0 == "" {
+				return "", false
+			}
+			cmd += " limit:" + arg0
+		case "skip":
+			if arg0 == "" {
+				return "", false
+			}
+			cmd += " skip:" + arg0
+		default:
+			return "", false
+		}
+		chain = strings.TrimSpace(rest)
+	}
+	return cmd, true
 }
 
 func isIdentStart(c byte) bool {

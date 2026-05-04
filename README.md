@@ -14,6 +14,12 @@ curl -fsSL https://raw.githubusercontent.com/LFroesch/bobdb/main/install.sh | ba
 
 Or download a binary from [GitHub Releases](https://github.com/LFroesch/bobdb/releases).
 
+Or install with Go:
+
+```bash
+go install github.com/LFroesch/bobdb@latest
+```
+
 Or build from source:
 
 ```bash
@@ -65,7 +71,7 @@ bdb
 | `ctrl+u` | Open saved queries |
 | `f` / `x` / `y` | Open templates / examples / recent queries from the Query tab |
 | `esc` | Blur query editor |
-| `←` / `→` | Page visible query-result columns |
+| `←` / `→` | Move the focused Browse/Results column; the viewport follows when needed |
 | `c` | Copy the current table/value/detail/query/row where available |
 | `C` | Open `copy as` for query strings or Browse/Results rows (`JSON`, `CSV`, language string literals) |
 | `v` | Open the structured detail viewer |
@@ -97,6 +103,7 @@ The Query tab uses a single assistance flow across backends:
 - Mongo completions now guide command -> collection -> arguments, including filter/sort JSON field hints, top-level operators like `$or` / `$and`, nested comparison operators like `$gt`, and on-demand sampled value suggestions for field values.
 - Mongo `find(...)` and `findOne(...)` now have a projection multi-select flow parallel to SQL column picking: pressing `tab` at the end of `db.collection.find(filter)` or `db.collection.findOne(filter)` opens a field picker, `space` toggles fields, and `tab` inserts the projection argument while keeping Mongo's default `_id` behavior.
 - Mongo `findOne(...)` now gets the same schema-aware filter-field completion as `find(...)`, so the two read commands do not diverge on the first argument.
+- Mongo shell parsing now accepts common demo-path extras: chained `find(...).sort(...).limit(...).skip(...)`, regex literals like `/foo/i`, and `NumberLong(...)` alongside the earlier relaxed JSON support for bare keys, single quotes, trailing commas, `ObjectId(...)`, and `ISODate(...)`.
 - Mongo `aggregate([...])` now opens stage-level completion at pipeline positions such as `aggregate([` or after a stage comma, offering `$match`, `$project`, `$group`, `$sort`, `$limit`, and related stages instead of only a couple of whole-pipeline snippets.
 - When replacing a nested Mongo operator inside an existing field object (for example `$regex` -> `$in`), autocomplete now preserves the current value text and reshapes it when needed instead of rebuilding the whole object.
 - If you change collections inside the same query (for example `db.users.find(...)` to `db.comments.find(...)`), filter/value completions follow the new collection context.
@@ -127,7 +134,7 @@ The footer reflects the current mode — picker-open mode shows `↑/↓ · tab 
 
 - **SQLite** — path to `.sqlite` / `.db` file
 - **Postgres** — `postgres://user:pass@host:5432/dbname`
-- **MongoDB** — `mongodb://user:pass@host:27017/dbname` — uses standard shell syntax: `db.collection.find({})`, `db.collection.aggregate([...])`, `db.collection.updateOne({},{$set:{}})`, etc. Use `tab` completions, `ctrl+t` templates, `ctrl+e` examples, or `ctrl+g` to generate from natural language via Ollama.
+- **MongoDB** — `mongodb://user:pass@host:27017/dbname` — uses standard shell syntax: `db.collection.find({})`, `db.collection.aggregate([...])`, `db.collection.insertMany([...])`, `db.collection.updateOne({},{$set:{}})`, etc. Use `tab` completions, `ctrl+t` templates, `ctrl+e` examples, or `ctrl+g` to generate from natural language via Ollama.
 
 Config saved to `~/.config/bobdb/config.json`. `bobdb` now creates that directory with owner-only access and writes the config file with `0600` permissions because DSNs often contain credentials. Passwords embedded in DSNs are masked on the Connections detail pane so they don't appear in screenshots or over-the-shoulder views; editing or copying the DSN still yields the full original string.
 

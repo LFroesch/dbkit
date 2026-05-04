@@ -1253,6 +1253,7 @@ func TestResultsTabResetsToFirstRowAndColumn(t *testing.T) {
 		},
 	}
 	m.resultColOffset = 2
+	m.resultFocusColumn = 2
 	m.resultVisibleColumn = 1
 	m.resultTable.SetCursor(1)
 
@@ -1268,8 +1269,67 @@ func TestResultsTabResetsToFirstRowAndColumn(t *testing.T) {
 	if got.resultColOffset != 0 {
 		t.Fatalf("resultColOffset = %d, want 0", got.resultColOffset)
 	}
+	if got.resultFocusColumn != 0 {
+		t.Fatalf("resultFocusColumn = %d, want 0", got.resultFocusColumn)
+	}
 	if got.resultTable.Cursor() != 0 {
 		t.Fatalf("result row cursor = %d, want 0", got.resultTable.Cursor())
+	}
+}
+
+func TestContextualEditUsesFocusedBrowseColumn(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabBrowse
+	m.focus = panelRight
+	m.browseView = browseViewData
+	m.tables = []string{"users"}
+	m.tableCursor = 0
+	m.browseData = &db.QueryResult{
+		Columns: []string{"id", "email", "role"},
+		Rows: [][]string{
+			{"1", "alice@example.com", "admin"},
+		},
+	}
+	m.width = 60
+	m.syncBrowseDataTable()
+	m.moveBrowseFocusColumn(1)
+
+	next, _ := m.openContextualEdit()
+	got := next.(Model)
+
+	if !strings.Contains(got.queryInput.Value(), `SET "email" = 'alice@example.com'`) {
+		t.Fatalf("query = %q, want focused email column", got.queryInput.Value())
+	}
+	if strings.Contains(got.queryInput.Value(), `SET "id" = '1'`) {
+		t.Fatalf("query = %q, should not target leftmost visible column for SET", got.queryInput.Value())
+	}
+}
+
+func TestContextualEditUsesFocusedResultColumn(t *testing.T) {
+	m := newModel(&config.Config{})
+	m.activeDB = &fakeDB{dbType: "sqlite"}
+	m.activeTab = tabResults
+	m.focus = panelRight
+	m.querySourceTable = "users"
+	m.queryResult = &db.QueryResult{
+		Columns: []string{"id", "email", "role"},
+		Rows: [][]string{
+			{"1", "alice@example.com", "admin"},
+		},
+	}
+	m.width = 60
+	m.syncResultTable()
+	m.moveResultFocusColumn(2)
+
+	next, _ := m.openContextualEdit()
+	got := next.(Model)
+
+	if !strings.Contains(got.queryInput.Value(), `SET "role" = 'admin'`) {
+		t.Fatalf("query = %q, want focused role column", got.queryInput.Value())
+	}
+	if strings.Contains(got.queryInput.Value(), `SET "id" = '1'`) {
+		t.Fatalf("query = %q, should not target leftmost visible column for SET", got.queryInput.Value())
 	}
 }
 

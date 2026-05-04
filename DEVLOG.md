@@ -1,5 +1,19 @@
 # Devlog
 
+## 2026-05-04 — focused-cell edit actually focuses + Mongo shell demo parity
+
+- **Contextual edit now uses a real horizontal selection**: Browse data and Results each track a focused column separately from the viewport offset. `←` / `→` move that focused column, the table viewport follows it when needed, the pane metadata now shows the focused field name, and `e` / `E` build edits against that actual focused cell instead of the leftmost visible column.
+- **Mongo demo-path shell syntax widened**: the shell parser/relaxed-JSON layer now handles chained `find(...).sort(...).limit(...).skip(...)`, regex literals like `/foo/i`, and `NumberLong(...)`. `runFind` also understands tagged `sort:` / `limit:` / `skip:` / `projection:` options emitted by the shell parser so those chains execute instead of being silently rejected.
+- **Regression coverage**: added UI tests proving contextual edit follows the focused Browse/Results column, plus parser tests for chained `find` cursor methods, regex literals, and `NumberLong(...)`.
+- Touched: `model.go`, `update.go`, `view.go`, `model_flow_test.go`, `internal/db/mongo.go`, `internal/db/mongo_relax_test.go`, `WORK.md`, `README.md`, `DEVLOG.md`.
+
+## 2026-05-04 — Mongo `insertMany` execution fix + v1 blocker audit
+
+- **Silent data-loss path fixed**: shell-form `db.collection.insertMany([...])` already required confirmation, but execution still funneled through `runInsert`, which only decoded a single `bson.M`. In practice that meant `insertMany` silently degraded to one insert instead of many. `runInsert` now accepts both object and array payloads: object payloads still use `InsertOne`, while array payloads fan into `InsertMany` and report the inserted document count.
+- **Regression coverage**: added a parser-level check that `parseShellQuery` preserves the array payload for `insertMany`, which is the contract `runInsert` now relies on.
+- **WORK cleanup**: rewrote `WORK.md` away from "v1 done" to a narrower closeout sprint focused on the remaining user-visible issues uncovered in the audit: contextual edit/focused-cell mismatch and the remaining Mongo shell-dialect gaps.
+- Touched: `internal/db/mongo.go`, `internal/db/mongo_relax_test.go`, `WORK.md`, `README.md`, `DEVLOG.md`.
+
 ## 2026-04-24 — Postgres value-bounds parity + SQL multi-table context
 
 - **Value-replacement parity gap**: `sqlValueCompletion` previously set `End: req.Cursor`, so completing inside an existing literal (`name = 'old|stuff'`) only replaced the prefix and left the trailing `stuff'` dangling — Mongo's `MongoJSONValueBounds` extends past the literal body. Fixed: `End` now walks forward through the literal contents (handling `''` SQL escape and backslash escapes) and stops at the closing quote, so the inserted value cleanly replaces the full body while the existing closing quote stays in place.

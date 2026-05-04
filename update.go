@@ -65,6 +65,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.browseData = nil
 		m.browseDataTableName = ""
 		m.browseDataTable.SetRows(nil)
+		m.browseFocusColumn = 0
 		m.browseColOffset = 0
 		m.browseVisibleColumn = 0
 		m.querySourceTable = ""
@@ -74,6 +75,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.queryResult = nil
 		m.queryErr = ""
 		m.resultTable.SetRows(nil)
+		m.resultFocusColumn = 0
 		m.resultColOffset = 0
 		m.resultVisibleColumn = 0
 		m.loading = true
@@ -161,6 +163,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.browseData = msg.result
 		m.browseDataTableName = msg.table
+		m.browseFocusColumn = 0
 		m.browseColOffset = 0
 		m.browseDataTable.SetCursor(0)
 		m.syncBrowseDataTable()
@@ -469,10 +472,10 @@ func (m Model) updateBrowseData(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.browseDataTable, cmd = m.browseDataTable.Update(msg)
 		return m, cmd
 	case "h", "left":
-		m.shiftBrowseColumns(-1)
+		m.moveBrowseFocusColumn(-1)
 		return m, nil
 	case "l", "right":
-		m.shiftBrowseColumns(1)
+		m.moveBrowseFocusColumn(1)
 		return m, nil
 	case "enter":
 		m.browseView = browseViewSchema
@@ -732,12 +735,12 @@ func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "h", "shift+left", "left":
 		if m.focus == panelRight {
-			m.shiftResultColumns(-1)
+			m.moveResultFocusColumn(-1)
 			return m, nil
 		}
 	case "l", "shift+right", "right":
 		if m.focus == panelRight {
-			m.shiftResultColumns(1)
+			m.moveResultFocusColumn(1)
 			return m, nil
 		}
 	case "v":
@@ -1149,6 +1152,7 @@ func (m *Model) togglePanel() {
 func (m *Model) resetResultViewport() {
 	m.resultColOffset = 0
 	m.resultVisibleColumn = 0
+	m.resultFocusColumn = 0
 	m.resultTable.SetCursor(0)
 }
 
@@ -1184,6 +1188,7 @@ func (m Model) moveTableCursor(delta int) (tea.Model, tea.Cmd) {
 	m.syncHelperCursor()
 	m.browseData = nil
 	m.browseDataTableName = ""
+	m.browseFocusColumn = 0
 	m.browseColOffset = 0
 	m.browseVisibleColumn = 0
 	m.browseDataTable.SetRows(nil)
@@ -1499,28 +1504,14 @@ func (m Model) focusedBrowseColumn() string {
 	if m.browseData == nil || len(m.browseData.Columns) == 0 {
 		return ""
 	}
-	colIdx := m.browseColOffset
-	if colIdx < 0 {
-		colIdx = 0
-	}
-	if colIdx >= len(m.browseData.Columns) {
-		colIdx = len(m.browseData.Columns) - 1
-	}
-	return m.browseData.Columns[colIdx]
+	return m.browseData.Columns[clampInt(m.browseFocusColumn, 0, len(m.browseData.Columns)-1)]
 }
 
 func (m Model) focusedResultColumn() string {
 	if m.queryResult == nil || len(m.queryResult.Columns) == 0 {
 		return ""
 	}
-	colIdx := m.resultColOffset
-	if colIdx < 0 {
-		colIdx = 0
-	}
-	if colIdx >= len(m.queryResult.Columns) {
-		colIdx = len(m.queryResult.Columns) - 1
-	}
-	return m.queryResult.Columns[colIdx]
+	return m.queryResult.Columns[clampInt(m.resultFocusColumn, 0, len(m.queryResult.Columns)-1)]
 }
 
 func (m Model) buildContextualUpdate(tableName, focusedCol string, rowCols, rowValues []string, prefill bool) string {
@@ -1989,11 +1980,13 @@ func (m *Model) syncResultTable() {
 	if m.queryResult == nil || len(m.queryResult.Columns) == 0 {
 		m.resultTable.SetRows(nil)
 		m.resultTable.SetColumns(nil)
+		m.resultFocusColumn = 0
 		m.resultVisibleColumn = 0
 		return
 	}
 
-	start, cols := visibleResultColumns(m.queryResult, w, m.resultColOffset)
+	m.resultFocusColumn = clampInt(m.resultFocusColumn, 0, len(m.queryResult.Columns)-1)
+	start, cols := visibleColumnsAroundFocus(m.queryResult, w, m.resultColOffset, m.resultFocusColumn)
 	m.resultColOffset = start
 	m.resultVisibleColumn = len(cols)
 
@@ -2046,16 +2039,30 @@ func (m *Model) shiftResultColumns(delta int) {
 	m.syncResultTable()
 }
 
+func (m *Model) moveResultFocusColumn(delta int) {
+	if m.queryResult == nil || len(m.queryResult.Columns) == 0 {
+		return
+	}
+	next := clampInt(m.resultFocusColumn+delta, 0, len(m.queryResult.Columns)-1)
+	if next == m.resultFocusColumn {
+		return
+	}
+	m.resultFocusColumn = next
+	m.syncResultTable()
+}
+
 func (m *Model) syncBrowseDataTable() {
 	w := max(12, m.tableViewportWidth())
 	if m.browseData == nil || len(m.browseData.Columns) == 0 {
 		m.browseDataTable.SetRows(nil)
 		m.browseDataTable.SetColumns(nil)
+		m.browseFocusColumn = 0
 		m.browseVisibleColumn = 0
 		return
 	}
 
-	start, cols := visibleResultColumns(m.browseData, w, m.browseColOffset)
+	m.browseFocusColumn = clampInt(m.browseFocusColumn, 0, len(m.browseData.Columns)-1)
+	start, cols := visibleColumnsAroundFocus(m.browseData, w, m.browseColOffset, m.browseFocusColumn)
 	m.browseColOffset = start
 	m.browseVisibleColumn = len(cols)
 
@@ -2105,6 +2112,18 @@ func (m *Model) shiftBrowseColumns(delta int) {
 		return
 	}
 	m.browseColOffset = next
+	m.syncBrowseDataTable()
+}
+
+func (m *Model) moveBrowseFocusColumn(delta int) {
+	if m.browseData == nil || len(m.browseData.Columns) == 0 {
+		return
+	}
+	next := clampInt(m.browseFocusColumn+delta, 0, len(m.browseData.Columns)-1)
+	if next == m.browseFocusColumn {
+		return
+	}
+	m.browseFocusColumn = next
 	m.syncBrowseDataTable()
 }
 

@@ -724,6 +724,7 @@ func (m Model) browseDataMeta() string {
 	parts := []string{
 		dimStyle.Render(fmt.Sprintf("%d row(s)", len(m.browseData.Rows))),
 		dimStyle.Render(fmt.Sprintf("cols %d-%d/%d", start, end, totalCols)),
+		dimStyle.Render(fmt.Sprintf("focus %s", truncate(m.focusedBrowseColumn(), 18))),
 	}
 	if totalCols > m.browseVisibleColumn {
 		parts = append(parts, accentStyle.Render("←/→ columns"))
@@ -934,6 +935,7 @@ func (m Model) renderHelpModal() string {
 		keyStyle.Render("1-4") + " " + actionStyle.Render("switch tabs"),
 		keyStyle.Render("tab") + " " + actionStyle.Render("toggle left/right pane"),
 		keyStyle.Render("↑/↓") + " " + actionStyle.Render("move selection"),
+		keyStyle.Render("←/→") + " " + actionStyle.Render("move focused column in Browse/Results"),
 		keyStyle.Render("enter") + " " + actionStyle.Render("connect / select / use"),
 		keyStyle.Render("n") + " " + actionStyle.Render("new connection"),
 		keyStyle.Render("e") + " " + actionStyle.Render("edit selected connection"),
@@ -1105,6 +1107,7 @@ func (m Model) renderResultMeta() string {
 	parts := []string{
 		dimStyle.Render(fmt.Sprintf("%d row(s)", len(m.queryResult.Rows))),
 		dimStyle.Render(fmt.Sprintf("cols %d-%d/%d", start, end, totalCols)),
+		dimStyle.Render(fmt.Sprintf("focus %s", truncate(m.focusedResultColumn(), 18))),
 	}
 	if m.queryResult.Message != "" {
 		parts = append(parts, warnStyle.Render(m.queryResult.Message))
@@ -1536,6 +1539,23 @@ func visibleResultColumns(result *db.QueryResult, width, offset int) (int, []tab
 	}
 	if len(cols) == 0 {
 		cols = append(cols, table.Column{Title: result.Columns[start], Width: max(6, width-cellChrome)})
+	}
+	return start, cols
+}
+
+func visibleColumnsAroundFocus(result *db.QueryResult, width, offset, focus int) (int, []table.Column) {
+	if result == nil || len(result.Columns) == 0 {
+		return 0, nil
+	}
+	focus = clampInt(focus, 0, len(result.Columns)-1)
+	offset = clampInt(offset, 0, len(result.Columns)-1)
+	if focus < offset {
+		offset = focus
+	}
+	start, cols := visibleResultColumns(result, width, offset)
+	for focus >= start+len(cols) && start < len(result.Columns)-1 {
+		start++
+		start, cols = visibleResultColumns(result, width, start)
 	}
 	return start, cols
 }
